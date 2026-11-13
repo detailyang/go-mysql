@@ -6,34 +6,39 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/juju/errors"
-	. "github.com/siddontang/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/stmt"
+	"github.com/pingcap/errors"
 )
 
-var paramFieldData []byte
-var columnFieldData []byte
-
-func init() {
-	var p = &Field{Name: []byte("?")}
-	var c = &Field{}
-
-	paramFieldData = p.Dump()
-	columnFieldData = c.Dump()
-}
+var (
+	paramFieldData  = (&mysql.Field{Name: []byte("?")}).Dump()
+	columnFieldData = (&mysql.Field{}).Dump()
+)
 
 type Stmt struct {
-	ID    uint32
 	Query string
+	Args  []any
 
-	Params  int
-	Columns int
+	Context any
 
-	Args []interface{}
+	// paramTypes holds the parameter types from the last execution that sent them.
+	// Clients only send them again when they change (new-params-bound flag).
+	paramTypes []byte
 
-	Context interface{}
+	// longData marks the parameters sent with COM_STMT_SEND_LONG_DATA since the last
+	// execution. COM_STMT_EXECUTE carries no inline value for them.
+	longData []bool
+
+	// cursor holds the result set of an execution that asked for a read-only
+	// cursor. COM_STMT_FETCH sends its rows in batches and drains RowDatas.
+	cursor *mysql.Resultset
+
+	// PreparedStmt contains common fields shared with client.Stmt for proxy passthrough
+	stmt.PreparedStmt
 }
 
-func (s *Stmt) Rest(params int, columns int, context interface{}) {
+func (s *Stmt) Rest(params int, columns int, context any) {
 	s.Params = params
 	s.Columns = columns
 	s.Context = context
@@ -41,23 +46,24 @@ func (s *Stmt) Rest(params int, columns int, context interface{}) {
 }
 
 func (s *Stmt) ResetParams() {
-	s.Args = make([]interface{}, s.Params)
+	s.Args = make([]any, s.Params)
+	s.longData = make([]bool, s.Params)
 }
 
 func (c *Conn) writePrepare(s *Stmt) error {
 	data := make([]byte, 4, 128)
 
-	//status ok
+	// status ok
 	data = append(data, 0)
-	//stmt id
-	data = append(data, Uint32ToBytes(s.ID)...)
-	//number columns
-	data = append(data, Uint16ToBytes(uint16(s.Columns))...)
-	//number params
-	data = append(data, Uint16ToBytes(uint16(s.Params))...)
-	//filter [00]
+	// stmt id
+	data = append(data, mysql.Uint32ToBytes(s.ID)...)
+	// number columns
+	data = append(data, mysql.Uint16ToBytes(uint16(s.Columns))...)
+	// number params
+	data = append(data, mysql.Uint16ToBytes(uint16(s.Params))...)
+	// filter [00]
 	data = append(data, 0)
-	//warning count
+	// warning count
 	data = append(data, 0, 0)
 
 	if err := c.WritePacket(data); err != nil {
@@ -67,39 +73,54 @@ func (c *Conn) writePrepare(s *Stmt) error {
 	if s.Params > 0 {
 		for i := 0; i < s.Params; i++ {
 			data = data[0:4]
-			data = append(data, []byte(paramFieldData)...)
+			if s.RawParamFields != nil && i < len(s.RawParamFields) {
+				data = append(data, s.RawParamFields[i]...)
+			} else {
+				data = append(data, paramFieldData...)
+			}
 
 			if err := c.WritePacket(data); err != nil {
 				return errors.Trace(err)
 			}
 		}
 
-		if err := c.writeEOF(); err != nil {
-			return err
+		// with CLIENT_DEPRECATE_EOF the parameter definitions have no
+		// trailing EOF separator
+		if !c.deprecateEOF() {
+			if err := c.writeEOF(); err != nil {
+				return err
+			}
 		}
 	}
 
 	if s.Columns > 0 {
 		for i := 0; i < s.Columns; i++ {
 			data = data[0:4]
-			data = append(data, []byte(columnFieldData)...)
+			if s.RawColumnFields != nil && i < len(s.RawColumnFields) {
+				data = append(data, s.RawColumnFields[i]...)
+			} else {
+				data = append(data, columnFieldData...)
+			}
 
 			if err := c.WritePacket(data); err != nil {
 				return errors.Trace(err)
 			}
 		}
 
-		if err := c.writeEOF(); err != nil {
-			return err
+		// with CLIENT_DEPRECATE_EOF the column definitions have no trailing
+		// EOF separator
+		if !c.deprecateEOF() {
+			if err := c.writeEOF(); err != nil {
+				return err
+			}
 		}
-
 	}
 	return nil
 }
 
-func (c *Conn) handleStmtExecute(data []byte) (*Result, error) {
+func (c *Conn) handleStmtExecute(data []byte) (any, error) {
 	if len(data) < 9 {
-		return nil, ErrMalformPacket
+		return nil, mysql.ErrMalformPacket
 	}
 
 	pos := 0
@@ -108,22 +129,34 @@ func (c *Conn) handleStmtExecute(data []byte) (*Result, error) {
 
 	s, ok := c.stmts[id]
 	if !ok {
-		return nil, NewDefaultError(ER_UNKNOWN_STMT_HANDLER,
+		return nil, mysql.NewDefaultError(mysql.ER_UNKNOWN_STMT_HANDLER, 5,
 			strconv.FormatUint(uint64(id), 10), "stmt_execute")
 	}
 
 	flag := data[pos]
 	pos++
-	//now we only support CURSOR_TYPE_NO_CURSOR flag
-	if flag != 0 {
-		return nil, NewError(ER_UNKNOWN_ERROR, fmt.Sprintf("unsupported flag %d", flag))
+	// Supported types:
+	// - CURSOR_TYPE_NO_CURSOR
+	// - CURSOR_TYPE_READ_ONLY
+	// - PARAMETER_COUNT_AVAILABLE
+
+	// Make sure the first 4 bits are 0.
+	if flag>>4 != 0 {
+		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, fmt.Sprintf("unsupported flags 0x%x", flag))
 	}
 
-	//skip iteration-count, always 1
+	// Test for unsupported flags in the remaining 4 bits.
+	if flag&mysql.CURSOR_TYPE_FOR_UPDATE > 0 {
+		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, "unsupported flag CURSOR_TYPE_FOR_UPDATE")
+	}
+	if flag&mysql.CURSOR_TYPE_SCROLLABLE > 0 {
+		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, "unsupported flag CURSOR_TYPE_SCROLLABLE")
+	}
+
+	// skip iteration-count, always 1
 	pos += 4
 
 	var nullBitmaps []byte
-	var paramTypes []byte
 	var paramValues []byte
 
 	paramNum := s.Params
@@ -131,30 +164,44 @@ func (c *Conn) handleStmtExecute(data []byte) (*Result, error) {
 	if paramNum > 0 {
 		nullBitmapLen := (s.Params + 7) >> 3
 		if len(data) < (pos + nullBitmapLen + 1) {
-			return nil, ErrMalformPacket
+			return nil, mysql.ErrMalformPacket
 		}
 		nullBitmaps = data[pos : pos+nullBitmapLen]
 		pos += nullBitmapLen
 
-		//new param bound flag
-		if data[pos] == 1 {
-			pos++
+		// new param bound flag
+		newParamsBound := data[pos] == 1
+		pos++
+		if newParamsBound {
 			if len(data) < (pos + (paramNum << 1)) {
-				return nil, ErrMalformPacket
+				return nil, mysql.ErrMalformPacket
 			}
 
-			paramTypes = data[pos : pos+(paramNum<<1)]
-			pos += (paramNum << 1)
-
-			paramValues = data[pos:]
+			// copy the types, the packet buffer is reused
+			s.paramTypes = append(s.paramTypes[:0], data[pos:pos+(paramNum<<1)]...)
+			pos += paramNum << 1
+		} else if s.paramTypes == nil && s.needsParamTypes(nullBitmaps) {
+			// the values can't be decoded without the types of a previous execution
+			return nil, mysql.NewDefaultError(mysql.ER_WRONG_ARGUMENTS, "mysqld_stmt_execute")
 		}
 
-		if err := c.bindStmtArgs(s, nullBitmaps, paramTypes, paramValues); err != nil {
-			return nil, errors.Trace(err)
+		paramValues = data[pos:]
+
+		// Without types every value is NULL or long data (the client sends no types
+		// for Execute(nil)), and s.Args already holds them.
+		if s.paramTypes != nil {
+			if err := c.bindStmtArgs(s, nullBitmaps, s.paramTypes, paramValues); err != nil {
+				return nil, errors.Trace(err)
+			}
 		}
 	}
 
-	var r *Result
+	// An execution closes the cursor a previous one left open, whether or not
+	// this one succeeds: a stale cursor would answer the next fetch with the
+	// previous execution's rows.
+	c.resetCursor(s)
+
+	var r *mysql.Result
 	var err error
 	if r, err = c.h.HandleStmtExecute(s.Context, s.Query, s.Args); err != nil {
 		return nil, errors.Trace(err)
@@ -162,40 +209,112 @@ func (c *Conn) handleStmtExecute(data []byte) (*Result, error) {
 
 	s.ResetParams()
 
-	return r, nil
+	// A streaming result can't be buffered, so it keeps being sent inline.
+	if flag&mysql.CURSOR_TYPE_READ_ONLY == 0 || r == nil || !r.HasResultset() || r.IsStreaming() {
+		return r, nil
+	}
+
+	// MySQL answers a cursor execution with the column definitions only; the
+	// rows are served by COM_STMT_FETCH, which reads them from s.cursor.
+	s.cursor = r.Resultset
+	c.SetStatus(mysql.SERVER_STATUS_CURSOR_EXISTS)
+
+	return cursorResult{r.Resultset}, nil
+}
+
+// handleStmtFetch serves COM_STMT_FETCH, which asks for the next num_rows rows
+// of the cursor opened by COM_STMT_EXECUTE.
+func (c *Conn) handleStmtFetch(data []byte) (any, error) {
+	if len(data) < 8 {
+		return nil, mysql.ErrMalformPacket
+	}
+
+	id := binary.LittleEndian.Uint32(data[0:4])
+	numRows := binary.LittleEndian.Uint32(data[4:8])
+
+	s, ok := c.stmts[id]
+	if !ok {
+		return nil, mysql.NewDefaultError(mysql.ER_UNKNOWN_STMT_HANDLER, 5,
+			strconv.FormatUint(uint64(id), 10), "stmt_fetch")
+	}
+
+	if s.cursor == nil {
+		return nil, mysql.NewDefaultError(mysql.ER_STMT_HAS_NO_OPEN_CURSOR, id)
+	}
+
+	// A count larger than what is left serves the rest. Zero is a request for
+	// no rows: the batch comes back empty and the cursor stays open, the same
+	// answer MySQL gives.
+	if n := uint64(len(s.cursor.RowDatas)); uint64(numRows) > n {
+		numRows = uint32(n)
+	}
+
+	rows := s.cursor.RowDatas[:numRows]
+	s.cursor.RowDatas = s.cursor.RowDatas[numRows:]
+
+	// dispatch clears the cursor flags before every command, so the batch that
+	// keeps the cursor open has to say so again.
+	if len(s.cursor.RowDatas) == 0 {
+		s.cursor = nil
+		c.SetStatus(mysql.SERVER_STATUS_LAST_ROW_SEND)
+	} else {
+		c.SetStatus(mysql.SERVER_STATUS_CURSOR_EXISTS)
+	}
+
+	return cursorRows(rows), nil
+}
+
+// resetCursor closes the cursor of s, if any, and clears its status flags.
+func (c *Conn) resetCursor(s *Stmt) {
+	s.cursor = nil
+	c.UnsetStatus(mysql.SERVER_STATUS_CURSOR_EXISTS)
+	c.UnsetStatus(mysql.SERVER_STATUS_LAST_ROW_SEND)
 }
 
 func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte) error {
 	args := s.Args
 
+	// Every param should have a type-and-flag of 2 bytes
+	// 0xfe80 == Type 0xfe and Flag 0x80
+	// The flag only has one bit and that indicates if it is unsigned or not.
+	// Types are 1 byte, but might grow into the 7 unused bits in the future.
+	if len(paramTypes)/2 != s.Params {
+		return mysql.ErrMalformPacket
+	}
+
 	pos := 0
 
 	var v []byte
-	var n int = 0
+	var n int
 	var isNull bool
 	var err error
 
 	for i := 0; i < s.Params; i++ {
+		if s.isLongData(i) {
+			// no inline value, args[i] holds the data sent in advance
+			continue
+		}
+
 		if nullBitmap[i>>3]&(1<<(uint(i)%8)) > 0 {
 			args[i] = nil
 			continue
 		}
 
 		tp := paramTypes[i<<1]
-		isUnsigned := (paramTypes[(i<<1)+1] & 0x80) > 0
+		isUnsigned := (paramTypes[(i<<1)+1] & mysql.PARAM_UNSIGNED) > 0
 
 		switch tp {
-		case MYSQL_TYPE_NULL:
+		case mysql.MYSQL_TYPE_NULL:
 			args[i] = nil
 			continue
 
-		case MYSQL_TYPE_TINY:
+		case mysql.MYSQL_TYPE_TINY:
 			if len(paramValues) < (pos + 1) {
-				return ErrMalformPacket
+				return mysql.ErrMalformPacket
 			}
 
 			if isUnsigned {
-				args[i] = uint8(paramValues[pos])
+				args[i] = paramValues[pos]
 			} else {
 				args[i] = int8(paramValues[pos])
 			}
@@ -203,35 +322,35 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 			pos++
 			continue
 
-		case MYSQL_TYPE_SHORT, MYSQL_TYPE_YEAR:
+		case mysql.MYSQL_TYPE_SHORT, mysql.MYSQL_TYPE_YEAR:
 			if len(paramValues) < (pos + 2) {
-				return ErrMalformPacket
+				return mysql.ErrMalformPacket
 			}
 
 			if isUnsigned {
-				args[i] = uint16(binary.LittleEndian.Uint16(paramValues[pos : pos+2]))
+				args[i] = binary.LittleEndian.Uint16(paramValues[pos : pos+2])
 			} else {
-				args[i] = int16((binary.LittleEndian.Uint16(paramValues[pos : pos+2])))
+				args[i] = int16(binary.LittleEndian.Uint16(paramValues[pos : pos+2]))
 			}
 			pos += 2
 			continue
 
-		case MYSQL_TYPE_INT24, MYSQL_TYPE_LONG:
+		case mysql.MYSQL_TYPE_INT24, mysql.MYSQL_TYPE_LONG:
 			if len(paramValues) < (pos + 4) {
-				return ErrMalformPacket
+				return mysql.ErrMalformPacket
 			}
 
 			if isUnsigned {
-				args[i] = uint32(binary.LittleEndian.Uint32(paramValues[pos : pos+4]))
+				args[i] = binary.LittleEndian.Uint32(paramValues[pos : pos+4])
 			} else {
 				args[i] = int32(binary.LittleEndian.Uint32(paramValues[pos : pos+4]))
 			}
 			pos += 4
 			continue
 
-		case MYSQL_TYPE_LONGLONG:
+		case mysql.MYSQL_TYPE_LONGLONG:
 			if len(paramValues) < (pos + 8) {
-				return ErrMalformPacket
+				return mysql.ErrMalformPacket
 			}
 
 			if isUnsigned {
@@ -242,47 +361,46 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 			pos += 8
 			continue
 
-		case MYSQL_TYPE_FLOAT:
+		case mysql.MYSQL_TYPE_FLOAT:
 			if len(paramValues) < (pos + 4) {
-				return ErrMalformPacket
+				return mysql.ErrMalformPacket
 			}
 
-			args[i] = float32(math.Float32frombits(binary.LittleEndian.Uint32(paramValues[pos : pos+4])))
+			args[i] = math.Float32frombits(binary.LittleEndian.Uint32(paramValues[pos : pos+4]))
 			pos += 4
 			continue
 
-		case MYSQL_TYPE_DOUBLE:
+		case mysql.MYSQL_TYPE_DOUBLE:
 			if len(paramValues) < (pos + 8) {
-				return ErrMalformPacket
+				return mysql.ErrMalformPacket
 			}
 
 			args[i] = math.Float64frombits(binary.LittleEndian.Uint64(paramValues[pos : pos+8]))
 			pos += 8
 			continue
 
-		case MYSQL_TYPE_DECIMAL, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_VARCHAR,
-			MYSQL_TYPE_BIT, MYSQL_TYPE_ENUM, MYSQL_TYPE_SET, MYSQL_TYPE_TINY_BLOB,
-			MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_LONG_BLOB, MYSQL_TYPE_BLOB,
-			MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_STRING, MYSQL_TYPE_GEOMETRY,
-			MYSQL_TYPE_DATE, MYSQL_TYPE_NEWDATE,
-			MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_DATETIME, MYSQL_TYPE_TIME:
+		case mysql.MYSQL_TYPE_DECIMAL, mysql.MYSQL_TYPE_NEWDECIMAL, mysql.MYSQL_TYPE_VARCHAR, mysql.MYSQL_TYPE_BIT,
+			mysql.MYSQL_TYPE_ENUM, mysql.MYSQL_TYPE_SET, mysql.MYSQL_TYPE_TINY_BLOB, mysql.MYSQL_TYPE_MEDIUM_BLOB,
+			mysql.MYSQL_TYPE_LONG_BLOB, mysql.MYSQL_TYPE_BLOB, mysql.MYSQL_TYPE_VAR_STRING, mysql.MYSQL_TYPE_STRING,
+			mysql.MYSQL_TYPE_GEOMETRY, mysql.MYSQL_TYPE_VECTOR,
+			mysql.MYSQL_TYPE_DATE, mysql.MYSQL_TYPE_NEWDATE,
+			mysql.MYSQL_TYPE_TIMESTAMP, mysql.MYSQL_TYPE_DATETIME, mysql.MYSQL_TYPE_TIME:
 			if len(paramValues) < (pos + 1) {
-				return ErrMalformPacket
+				return mysql.ErrMalformPacket
 			}
 
-			v, isNull, n, err = LengthEnodedString(paramValues[pos:])
+			v, isNull, n, err = mysql.LengthEncodedString(paramValues[pos:])
 			pos += n
 			if err != nil {
 				return errors.Trace(err)
 			}
 
 			if !isNull {
-				args[i] = v
-				continue
-			} else {
-				args[i] = nil
+				args[i] = mysql.TypedBytes{Type: tp, Bytes: v}
 				continue
 			}
+			args[i] = nil
+			continue
 		default:
 			return errors.Errorf("Stmt Unknown FieldType %d", tp)
 		}
@@ -290,7 +408,7 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 	return nil
 }
 
-// stmt send long data command has no repsonse
+// stmt send long data command has no response
 func (c *Conn) handleStmtSendLongData(data []byte) error {
 	if len(data) < 6 {
 		return nil
@@ -303,17 +421,22 @@ func (c *Conn) handleStmtSendLongData(data []byte) error {
 		return nil
 	}
 
-	paramId := binary.LittleEndian.Uint16(data[4:6])
-	if paramId >= uint16(s.Params) {
+	paramID := binary.LittleEndian.Uint16(data[4:6])
+	if paramID >= uint16(s.Params) {
 		return nil
 	}
 
-	if s.Args[paramId] == nil {
-		s.Args[paramId] = data[6:]
+	if s.longData == nil {
+		s.longData = make([]bool, s.Params)
+	}
+	s.longData[paramID] = true
+
+	if s.Args[paramID] == nil {
+		s.Args[paramID] = data[6:]
 	} else {
-		if b, ok := s.Args[paramId].([]byte); ok {
+		if b, ok := s.Args[paramID].([]byte); ok {
 			b = append(b, data[6:]...)
-			s.Args[paramId] = b
+			s.Args[paramID] = b
 		} else {
 			return nil
 		}
@@ -322,25 +445,26 @@ func (c *Conn) handleStmtSendLongData(data []byte) error {
 	return nil
 }
 
-func (c *Conn) handleStmtReset(data []byte) (*Result, error) {
+func (c *Conn) handleStmtReset(data []byte) (*mysql.Result, error) {
 	if len(data) < 4 {
-		return nil, ErrMalformPacket
+		return nil, mysql.ErrMalformPacket
 	}
 
 	id := binary.LittleEndian.Uint32(data[0:4])
 
 	s, ok := c.stmts[id]
 	if !ok {
-		return nil, NewDefaultError(ER_UNKNOWN_STMT_HANDLER,
+		return nil, mysql.NewDefaultError(mysql.ER_UNKNOWN_STMT_HANDLER, 5,
 			strconv.FormatUint(uint64(id), 10), "stmt_reset")
 	}
 
 	s.ResetParams()
+	c.resetCursor(s)
 
-	return &Result{}, nil
+	return mysql.NewResultReserveResultset(0), nil
 }
 
-// stmt close command has no repsonse
+// stmt close command has no response
 func (c *Conn) handleStmtClose(data []byte) error {
 	if len(data) < 4 {
 		return nil
@@ -357,7 +481,23 @@ func (c *Conn) handleStmtClose(data []byte) error {
 		return err
 	}
 
+	c.resetCursor(stmt)
 	delete(c.stmts, id)
 
 	return nil
+}
+
+func (s *Stmt) isLongData(i int) bool {
+	return i < len(s.longData) && s.longData[i]
+}
+
+// needsParamTypes reports whether a parameter that is neither NULL nor long data
+// is set, so its inline value can't be decoded without the parameter types.
+func (s *Stmt) needsParamTypes(nullBitmap []byte) bool {
+	for i := range s.Params {
+		if !s.isLongData(i) && nullBitmap[i>>3]&(1<<(uint(i)%8)) == 0 {
+			return true
+		}
+	}
+	return false
 }

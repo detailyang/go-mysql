@@ -7,45 +7,65 @@ package schema
 import (
 	"database/sql"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 
-	"github.com/juju/errors"
-	"github.com/siddontang/go-mysql/mysql"
+	"github.com/pingcap/errors"
+
+	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
-var ErrTableNotExist = errors.New("table is not exist")
-var ErrMissingTableMeta = errors.New("missing table meta")
-var HAHealthCheckSchema = "mysql.ha_health_check"
+var (
+	ErrTableNotExist    = errors.New("table is not exist")
+	ErrMissingTableMeta = errors.New("missing table meta")
+	HAHealthCheckSchema = "mysql.ha_health_check"
+)
 
+// Different column type
+//
+//nolint:revive // exported column-type constants kept for backward compatibility
 const (
-	TYPE_NUMBER    = iota + 1 // tinyint, smallint, mediumint, int, bigint, year
+	TYPE_NUMBER    = iota + 1 // tinyint, smallint, int, bigint, year
 	TYPE_FLOAT                // float, double
 	TYPE_ENUM                 // enum
 	TYPE_SET                  // set
-	TYPE_STRING               // other
+	TYPE_STRING               // char, varchar, etc.
 	TYPE_DATETIME             // datetime
 	TYPE_TIMESTAMP            // timestamp
 	TYPE_DATE                 // date
 	TYPE_TIME                 // time
 	TYPE_BIT                  // bit
 	TYPE_JSON                 // json
+	TYPE_DECIMAL              // decimal
+	TYPE_MEDIUM_INT
+	TYPE_BINARY // binary, varbinary
+	TYPE_POINT  // coordinates
 )
 
 type TableColumn struct {
-	Name       string
-	Type       int
-	Collation  string
-	RawType    string
-	IsAuto     bool
-	IsUnsigned bool
-	EnumValues []string
-	SetValues  []string
+	Name           string
+	Type           int
+	Collation      string
+	RawType        string
+	IsAuto         bool
+	IsUnsigned     bool
+	IsVirtual      bool
+	IsStored       bool
+	IsDefaultExpr  bool
+	IsAutoUpdating bool
+	EnumValues     []string
+	SetValues      []string
+	FixedSize      uint
+	MaxSize        uint
 }
 
 type Index struct {
 	Name        string
 	Columns     []string
 	Cardinality []uint64
+	NoneUnique  uint64
+	Visible     bool
 }
 
 type Table struct {
@@ -55,6 +75,8 @@ type Table struct {
 	Columns   []TableColumn
 	Indexes   []*Index
 	PKColumns []int
+
+	UnsignedColumns []int
 }
 
 func (ta *Table) String() string {
@@ -66,53 +88,110 @@ func (ta *Table) AddColumn(name string, columnType string, collation string, ext
 	ta.Columns = append(ta.Columns, TableColumn{Name: name, Collation: collation})
 	ta.Columns[index].RawType = columnType
 
-	if strings.Contains(columnType, "int") || strings.HasPrefix(columnType, "year") {
-		ta.Columns[index].Type = TYPE_NUMBER
-	} else if strings.HasPrefix(columnType, "float") ||
-		strings.HasPrefix(columnType, "double") ||
-		strings.HasPrefix(columnType, "decimal") {
+	if strings.HasPrefix(columnType, "float") ||
+		strings.HasPrefix(columnType, "double") {
 		ta.Columns[index].Type = TYPE_FLOAT
+	} else if strings.HasPrefix(columnType, "decimal") {
+		ta.Columns[index].Type = TYPE_DECIMAL
 	} else if strings.HasPrefix(columnType, "enum") {
 		ta.Columns[index].Type = TYPE_ENUM
-		ta.Columns[index].EnumValues = strings.Split(strings.Replace(
+		ta.Columns[index].EnumValues = strings.Split(strings.ReplaceAll(
 			strings.TrimSuffix(
 				strings.TrimPrefix(
 					columnType, "enum("),
 				")"),
-			"'", "", -1),
+			"'", ""),
 			",")
 	} else if strings.HasPrefix(columnType, "set") {
 		ta.Columns[index].Type = TYPE_SET
-		ta.Columns[index].SetValues = strings.Split(strings.Replace(
+		ta.Columns[index].SetValues = strings.Split(strings.ReplaceAll(
 			strings.TrimSuffix(
 				strings.TrimPrefix(
 					columnType, "set("),
 				")"),
-			"'", "", -1),
+			"'", ""),
 			",")
+	} else if strings.HasPrefix(columnType, "binary") {
+		ta.Columns[index].Type = TYPE_BINARY
+		size := getSizeFromColumnType(columnType)
+		ta.Columns[index].MaxSize = size
+		ta.Columns[index].FixedSize = size
+	} else if strings.HasPrefix(columnType, "varbinary") {
+		ta.Columns[index].Type = TYPE_BINARY
+		ta.Columns[index].MaxSize = getSizeFromColumnType(columnType)
 	} else if strings.HasPrefix(columnType, "datetime") {
 		ta.Columns[index].Type = TYPE_DATETIME
 	} else if strings.HasPrefix(columnType, "timestamp") {
 		ta.Columns[index].Type = TYPE_TIMESTAMP
 	} else if strings.HasPrefix(columnType, "time") {
 		ta.Columns[index].Type = TYPE_TIME
-	} else if "date" == columnType {
+	} else if columnType == "date" {
 		ta.Columns[index].Type = TYPE_DATE
 	} else if strings.HasPrefix(columnType, "bit") {
 		ta.Columns[index].Type = TYPE_BIT
 	} else if strings.HasPrefix(columnType, "json") {
 		ta.Columns[index].Type = TYPE_JSON
+	} else if strings.Contains(columnType, "point") {
+		ta.Columns[index].Type = TYPE_POINT
+	} else if strings.Contains(columnType, "mediumint") {
+		ta.Columns[index].Type = TYPE_MEDIUM_INT
+	} else if strings.Contains(columnType, "int") || strings.HasPrefix(columnType, "year") {
+		ta.Columns[index].Type = TYPE_NUMBER
+	} else if strings.HasPrefix(columnType, "char") {
+		ta.Columns[index].Type = TYPE_STRING
+		size := getSizeFromColumnType(columnType)
+		ta.Columns[index].FixedSize = size
+		ta.Columns[index].MaxSize = size
 	} else {
 		ta.Columns[index].Type = TYPE_STRING
+		ta.Columns[index].MaxSize = getSizeFromColumnType(columnType)
 	}
 
 	if strings.Contains(columnType, "unsigned") || strings.Contains(columnType, "zerofill") {
 		ta.Columns[index].IsUnsigned = true
+		ta.UnsignedColumns = append(ta.UnsignedColumns, index)
 	}
 
-	if extra == "auto_increment" {
+	normalizedExtra := strings.ToLower(extra)
+	switch normalizedExtra {
+	case "auto_increment":
 		ta.Columns[index].IsAuto = true
+	case "virtual generated":
+		ta.Columns[index].IsVirtual = true
+	case "stored generated":
+		ta.Columns[index].IsStored = true
 	}
+
+	if strings.Contains(normalizedExtra, "default_generated") {
+		ta.Columns[index].IsDefaultExpr = true
+	}
+	if ta.Columns[index].Type == TYPE_DATETIME ||
+		ta.Columns[index].Type == TYPE_TIMESTAMP {
+		if strings.Contains(normalizedExtra, "on update current_timestamp") {
+			ta.Columns[index].IsAutoUpdating = true
+		}
+	}
+}
+
+func getSizeFromColumnType(columnType string) uint {
+	startIndex := strings.Index(columnType, "(")
+	if startIndex < 0 {
+		return 0
+	}
+
+	// we are searching for the first () and there may not be any closing
+	// brackets before the opening, so no need search at the offset from the
+	// opening ones
+	endIndex := strings.Index(columnType, ")")
+	if startIndex < 0 || endIndex < 0 || startIndex > endIndex {
+		return 0
+	}
+
+	i, err := strconv.Atoi(columnType[startIndex+1 : endIndex])
+	if err != nil || i < 0 {
+		return 0
+	}
+	return uint(i)
 }
 
 func (ta *Table) FindColumn(name string) int {
@@ -124,8 +203,16 @@ func (ta *Table) FindColumn(name string) int {
 	return -1
 }
 
+// Get TableColumn by column index of primary key.
 func (ta *Table) GetPKColumn(index int) *TableColumn {
+	if index >= len(ta.PKColumns) {
+		return nil
+	}
 	return &ta.Columns[ta.PKColumns[index]]
+}
+
+func (ta *Table) IsPrimaryKey(colIndex int) bool {
+	return slices.Contains(ta.PKColumns, colIndex)
 }
 
 func (ta *Table) AddIndex(name string) (index *Index) {
@@ -135,7 +222,7 @@ func (ta *Table) AddIndex(name string) (index *Index) {
 }
 
 func NewIndex(name string) *Index {
-	return &Index{name, make([]string, 0, 8), make([]uint64, 0, 8)}
+	return &Index{name, make([]string, 0, 8), make([]uint64, 0, 8), 0, true}
 }
 
 func (idx *Index) AddColumn(name string, cardinality uint64) {
@@ -165,6 +252,7 @@ func IsTableExist(conn mysql.Executer, schema string, name string) (bool, error)
 	return r.RowNumber() == 1, nil
 }
 
+//nolint:revive // exported function renamed would be a breaking API change
 func NewTableFromSqlDB(conn *sql.DB, schema string, name string) (*Table, error) {
 	ta := &Table{
 		Schema:  schema,
@@ -173,11 +261,11 @@ func NewTableFromSqlDB(conn *sql.DB, schema string, name string) (*Table, error)
 		Indexes: make([]*Index, 0, 8),
 	}
 
-	if err := ta.fetchColumnsViaSqlDB(conn); err != nil {
+	if err := ta.fetchColumnsViaSQLDB(conn); err != nil {
 		return nil, errors.Trace(err)
 	}
 
-	if err := ta.fetchIndexesViaSqlDB(conn); err != nil {
+	if err := ta.fetchIndexesViaSQLDB(conn); err != nil {
 		return nil, errors.Trace(err)
 	}
 
@@ -221,7 +309,7 @@ func (ta *Table) fetchColumns(conn mysql.Executer) error {
 	return nil
 }
 
-func (ta *Table) fetchColumnsViaSqlDB(conn *sql.DB) error {
+func (ta *Table) fetchColumnsViaSQLDB(conn *sql.DB) error {
 	r, err := conn.Query(fmt.Sprintf("show full columns from `%s`.`%s`", ta.Schema, ta.Name))
 	if err != nil {
 		return errors.Trace(err)
@@ -229,7 +317,7 @@ func (ta *Table) fetchColumnsViaSqlDB(conn *sql.DB) error {
 
 	defer r.Close()
 
-	var unusedVal interface{}
+	var unusedVal any
 	unused := &unusedVal
 
 	for r.Next() {
@@ -245,6 +333,30 @@ func (ta *Table) fetchColumnsViaSqlDB(conn *sql.DB) error {
 	return r.Err()
 }
 
+// hasInvisibleIndexSupportFromResult checks if the result from SHOW INDEX has Visible column
+func hasInvisibleIndexSupportFromResult(r *mysql.Result) bool {
+	for name := range r.FieldNames {
+		if strings.EqualFold(name, "Visible") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasInvisibleIndexSupportFromColumns checks if the columns from SHOW INDEX include Visible column
+func hasInvisibleIndexSupportFromColumns(cols []string) bool {
+	for _, col := range cols {
+		if strings.EqualFold(col, "Visible") {
+			return true
+		}
+	}
+	return false
+}
+
+func isIndexInvisible(value string) bool {
+	return strings.EqualFold(value, "NO")
+}
+
 func (ta *Table) fetchIndexes(conn mysql.Executer) error {
 	r, err := conn.Execute(fmt.Sprintf("show index from `%s`.`%s`", ta.Schema, ta.Name))
 	if err != nil {
@@ -252,6 +364,8 @@ func (ta *Table) fetchIndexes(conn mysql.Executer) error {
 	}
 	var currentIndex *Index
 	currentName := ""
+
+	hasInvisibleIndex := hasInvisibleIndexSupportFromResult(r)
 
 	for i := 0; i < r.RowNumber(); i++ {
 		indexName, _ := r.GetString(i, 2)
@@ -262,13 +376,17 @@ func (ta *Table) fetchIndexes(conn mysql.Executer) error {
 		cardinality, _ := r.GetUint(i, 6)
 		colName, _ := r.GetString(i, 4)
 		currentIndex.AddColumn(colName, cardinality)
+		currentIndex.NoneUnique, _ = r.GetUint(i, 1)
+		if hasInvisibleIndex {
+			visible, _ := r.GetString(i, 13)
+			currentIndex.Visible = !isIndexInvisible(visible)
+		}
 	}
 
 	return ta.fetchPrimaryKeyColumns()
-
 }
 
-func (ta *Table) fetchIndexesViaSqlDB(conn *sql.DB) error {
+func (ta *Table) fetchIndexesViaSQLDB(conn *sql.DB) error {
 	r, err := conn.Query(fmt.Sprintf("show index from `%s`.`%s`", ta.Schema, ta.Name))
 	if err != nil {
 		return errors.Trace(err)
@@ -279,28 +397,41 @@ func (ta *Table) fetchIndexesViaSqlDB(conn *sql.DB) error {
 	var currentIndex *Index
 	currentName := ""
 
-	var unusedVal interface{}
-	unused := &unusedVal
+	var unusedVal any
 
 	for r.Next() {
-		var indexName, colName string
-		var cardinality interface{}
-
-		err := r.Scan(
-			&unused,
-			&unused,
-			&indexName,
-			&unused,
-			&colName,
-			&unused,
-			&cardinality,
-			&unused,
-			&unused,
-			&unused,
-			&unused,
-			&unused,
-			&unused,
-		)
+		var indexName string
+		var colName sql.NullString
+		var noneUnique uint64
+		var cardinality any
+		var visible sql.NullString
+		cols, err := r.Columns()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		hasInvisibleIndex := hasInvisibleIndexSupportFromColumns(cols)
+		values := make([]any, len(cols))
+		for i := range cols {
+			switch i {
+			case 1:
+				values[i] = &noneUnique
+			case 2:
+				values[i] = &indexName
+			case 4:
+				values[i] = &colName
+			case 6:
+				values[i] = &cardinality
+			case 13:
+				if hasInvisibleIndex {
+					values[i] = &visible
+				} else {
+					values[i] = &unusedVal
+				}
+			default:
+				values[i] = &unusedVal
+			}
+		}
+		err = r.Scan(values...)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -311,13 +442,23 @@ func (ta *Table) fetchIndexesViaSqlDB(conn *sql.DB) error {
 		}
 
 		c := toUint64(cardinality)
-		currentIndex.AddColumn(colName, c)
+		// If colName is a null string, switch to ""
+		if colName.Valid {
+			currentIndex.AddColumn(colName.String, c)
+		} else {
+			currentIndex.AddColumn("", c)
+		}
+		currentIndex.NoneUnique = noneUnique
+
+		if hasInvisibleIndex && visible.Valid {
+			currentIndex.Visible = !isIndexInvisible(visible.String)
+		}
 	}
 
 	return ta.fetchPrimaryKeyColumns()
 }
 
-func toUint64(i interface{}) uint64 {
+func toUint64(i any) uint64 {
 	switch i := i.(type) {
 	case int:
 		return uint64(i)
@@ -338,7 +479,7 @@ func toUint64(i interface{}) uint64 {
 	case uint32:
 		return uint64(i)
 	case uint64:
-		return uint64(i)
+		return i
 	}
 
 	return 0
@@ -349,6 +490,7 @@ func (ta *Table) fetchPrimaryKeyColumns() error {
 		return nil
 	}
 
+	// Primary key must be the first index?
 	pkIndex := ta.Indexes[0]
 	if pkIndex.Name != "PRIMARY" {
 		return nil
@@ -360,4 +502,33 @@ func (ta *Table) fetchPrimaryKeyColumns() error {
 	}
 
 	return nil
+}
+
+// GetPKValues gets primary keys in one row for a table, a table may use multi fields as the PK
+func (ta *Table) GetPKValues(row []any) ([]any, error) {
+	indexes := ta.PKColumns
+	if len(indexes) == 0 {
+		return nil, errors.Errorf("table %s has no PK", ta)
+	} else if len(ta.Columns) != len(row) {
+		return nil, errors.Errorf("table %s has %d columns, but row data %v len is %d", ta,
+			len(ta.Columns), row, len(row))
+	}
+
+	values := make([]any, 0, len(indexes))
+
+	for _, index := range indexes {
+		values = append(values, row[index])
+	}
+
+	return values, nil
+}
+
+// GetColumnValue gets term column's value
+func (ta *Table) GetColumnValue(column string, row []any) (any, error) {
+	index := ta.FindColumn(column)
+	if index == -1 {
+		return nil, errors.Errorf("table %s has no column name %s", ta, column)
+	}
+
+	return row[index], nil
 }

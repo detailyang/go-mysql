@@ -2,14 +2,27 @@ package replication
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
+	"sync/atomic"
+	"time"
 
-	"github.com/juju/errors"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pingcap/errors"
+
+	"github.com/go-mysql-org/go-mysql/utils"
 )
 
+// ErrChecksumMismatch indicates binlog checksum mismatch.
+var ErrChecksumMismatch = errors.New("binlog checksum mismatch, data may be corrupted")
+
 type BinlogParser struct {
+	// "mysql" or "mariadb", if not set, use "mysql" by default
+	flavor string
+
 	format *FormatDescriptionEvent
 
 	tables map[uint64]*TableMapEvent
@@ -17,7 +30,36 @@ type BinlogParser struct {
 	// for rawMode, we only parse FormatDescriptionEvent and RotateEvent
 	rawMode bool
 
-	parseTime bool
+	parseTime               bool
+	timestampStringLocation *time.Location
+
+	// used to start/stop processing
+	stopProcessing atomic.Bool
+
+	useDecimal               bool
+	useFloatWithTrailingZero bool
+	renderJSONAsMySQLText    bool
+	ignoreJSONDecodeErr      bool
+	verifyChecksum           bool
+
+	payloadDecoderConcurrency int
+
+	// decoderPool caches the zstd decoder used to decompress
+	// TransactionPayloadEvent payloads. decodePayload runs on the
+	// parser's single stream goroutine, so at most one decoder is in
+	// flight and a capacity-1 channel holds the idle one; keeping it
+	// here instead of a package variable scopes its buffers to the
+	// parser. The channel is created lazily inside getPayloadDecoder;
+	// decoders are built on demand with payloadDecoderConcurrency and
+	// are only ever driven through DecodeAll, which starts no
+	// background goroutines. Close evicts the cached decoder; anything
+	// still cached when the parser becomes unreachable is reclaimed by
+	// GC.
+	decoderPool chan *zstd.Decoder
+
+	rowsEventDecodeFunc func(*RowsEvent, []byte) error
+
+	tableMapOptionalMetaDecodeFunc func([]byte) error
 }
 
 func NewBinlogParser() *BinlogParser {
@@ -28,8 +70,35 @@ func NewBinlogParser() *BinlogParser {
 	return p
 }
 
+func (p *BinlogParser) Stop() {
+	p.stopProcessing.Store(true)
+}
+
+func (p *BinlogParser) Resume() {
+	p.stopProcessing.Store(false)
+}
+
 func (p *BinlogParser) Reset() {
 	p.format = nil
+}
+
+// Close evicts the decoder cached in decoderPool, releasing its buffers
+// immediately instead of keeping them until the parser itself becomes
+// unreachable. The parser stays usable: the next getPayloadDecoder
+// rebuilds a decoder lazily.
+func (p *BinlogParser) Close() {
+	if p.decoderPool == nil {
+		return
+	}
+	for {
+		select {
+		case d := <-p.decoderPool:
+			d.Close()
+		default:
+			p.decoderPool = nil
+			return
+		}
+	}
 }
 
 type OnEventFunc func(*BinlogEvent) error
@@ -50,64 +119,100 @@ func (p *BinlogParser) ParseFile(name string, offset int64, onEvent OnEventFunc)
 
 	if offset < 4 {
 		offset = 4
+	} else if offset > 4 {
+		//  FORMAT_DESCRIPTION event should be read by default always (despite that fact passed offset may be higher than 4)
+		if _, err = f.Seek(4, io.SeekStart); err != nil {
+			return errors.Errorf("seek %s to %d error %v", name, offset, err)
+		}
+
+		if err = p.parseFormatDescriptionEvent(f, onEvent); err != nil {
+			return errors.Annotatef(err, "parse FormatDescriptionEvent")
+		}
 	}
 
-	if _, err = f.Seek(offset, os.SEEK_SET); err != nil {
+	if _, err = f.Seek(offset, io.SeekStart); err != nil {
 		return errors.Errorf("seek %s to %d error %v", name, offset, err)
 	}
 
 	return p.ParseReader(f, onEvent)
 }
 
-func (p *BinlogParser) ParseReader(r io.Reader, onEvent OnEventFunc) error {
+func (p *BinlogParser) parseFormatDescriptionEvent(r io.Reader, onEvent OnEventFunc) error {
+	_, err := p.parseSingleEvent(r, onEvent)
+	return err
+}
+
+// ParseSingleEvent parses single binlog event and passes the event to onEvent function.
+func (p *BinlogParser) ParseSingleEvent(r io.Reader, onEvent OnEventFunc) (bool, error) {
+	return p.parseSingleEvent(r, onEvent)
+}
+
+func (p *BinlogParser) parseSingleEvent(r io.Reader, onEvent OnEventFunc) (bool, error) {
 	var err error
 	var n int64
 
-	for {
-		headBuf := make([]byte, EventHeaderSize)
+	// Here we use `sync.Pool` to avoid allocate/destroy buffers frequently.
+	buf := utils.BytesBufferGet()
+	defer utils.BytesBufferPut(buf)
 
-		if _, err = io.ReadFull(r, headBuf); err == io.EOF {
-			return nil
-		} else if err != nil {
-			return errors.Trace(err)
+	if n, err = io.CopyN(buf, r, EventHeaderSize); err == io.EOF {
+		return true, nil
+	} else if err != nil {
+		return false, errors.Errorf("get event header err %v, need %d but got %d", err, EventHeaderSize, n)
+	}
+
+	var h *EventHeader
+	h, err = p.parseHeader(buf.Bytes())
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+
+	if h.EventSize < uint32(EventHeaderSize) {
+		return false, errors.Errorf("invalid event header, event size is %d, too small", h.EventSize)
+	}
+	if n, err = io.CopyN(buf, r, int64(h.EventSize-EventHeaderSize)); err != nil {
+		return false, errors.Errorf("get event err %v, need %d but got %d", err, h.EventSize, n)
+	}
+	if buf.Len() != int(h.EventSize) {
+		return false, errors.Errorf("invalid raw data size in event %s, need %d but got %d", h.EventType, h.EventSize, buf.Len())
+	}
+
+	var rawData []byte
+	rawData = append(rawData, buf.Bytes()...)
+	bodyLen := int(h.EventSize) - EventHeaderSize
+	body := rawData[EventHeaderSize:]
+	if len(body) != bodyLen {
+		return false, errors.Errorf("invalid body data size in event %s, need %d but got %d", h.EventType, bodyLen, len(body))
+	}
+
+	var e Event
+	e, err = p.parseEvent(h, body, rawData)
+	if err != nil {
+		if err == errMissingTableMapEvent {
+			return false, nil
 		}
+		return false, errors.Trace(err)
+	}
 
-		var h *EventHeader
-		h, err = p.parseHeader(headBuf)
+	if err = onEvent(&BinlogEvent{RawData: rawData, Header: h, Event: e}); err != nil {
+		return false, errors.Trace(err)
+	}
+
+	return false, nil
+}
+
+func (p *BinlogParser) ParseReader(r io.Reader, onEvent OnEventFunc) error {
+	for !p.stopProcessing.Load() {
+		done, err := p.parseSingleEvent(r, onEvent)
 		if err != nil {
-			return errors.Trace(err)
-		}
-
-		if h.EventSize <= uint32(EventHeaderSize) {
-			return errors.Errorf("invalid event header, event size is %d, too small", h.EventSize)
-
-		}
-
-		var buf bytes.Buffer
-		if n, err = io.CopyN(&buf, r, int64(h.EventSize)-int64(EventHeaderSize)); err != nil {
-			return errors.Errorf("get event body err %v, need %d - %d, but got %d", err, h.EventSize, EventHeaderSize, n)
-		}
-
-		data := buf.Bytes()
-		rawData := data
-
-		eventLen := int(h.EventSize) - EventHeaderSize
-
-		if len(data) != eventLen {
-			return errors.Errorf("invalid data size %d in event %s, less event length %d", len(data), h.EventType, eventLen)
-		}
-
-		var e Event
-		e, err = p.parseEvent(h, data)
-		if err != nil {
-			if _, ok := err.(errMissingTableMapEvent); ok {
+			if err == errMissingTableMapEvent {
 				continue
 			}
 			return errors.Trace(err)
 		}
 
-		if err = onEvent(&BinlogEvent{rawData, h, e}); err != nil {
-			return errors.Trace(err)
+		if done {
+			break
 		}
 	}
 
@@ -122,6 +227,129 @@ func (p *BinlogParser) SetParseTime(parseTime bool) {
 	p.parseTime = parseTime
 }
 
+func (p *BinlogParser) SetTimestampStringLocation(timestampStringLocation *time.Location) {
+	p.timestampStringLocation = timestampStringLocation
+}
+
+func (p *BinlogParser) SetUseDecimal(useDecimal bool) {
+	p.useDecimal = useDecimal
+}
+
+func (p *BinlogParser) SetUseFloatWithTrailingZero(useFloatWithTrailingZero bool) {
+	p.useFloatWithTrailingZero = useFloatWithTrailingZero
+}
+
+// SetRenderJSONAsMySQLText toggles MySQL-text JSON rendering for RowsEvents.
+// See BinlogSyncerConfig.RenderJSONAsMySQLText for the full rationale.
+func (p *BinlogParser) SetRenderJSONAsMySQLText(renderJSONAsMySQLText bool) {
+	p.renderJSONAsMySQLText = renderJSONAsMySQLText
+}
+
+func (p *BinlogParser) SetIgnoreJSONDecodeError(ignoreJSONDecodeErr bool) {
+	p.ignoreJSONDecodeErr = ignoreJSONDecodeErr
+}
+
+func (p *BinlogParser) SetVerifyChecksum(verify bool) {
+	p.verifyChecksum = verify
+}
+
+func (p *BinlogParser) SetFlavor(flavor string) {
+	p.flavor = flavor
+}
+
+// getPayloadDecoder returns a zstd decoder from the parser's decoder
+// cache, building one on first use. Decoder creation can fail, so it
+// happens here where the error can be returned to the caller instead of
+// being hidden inside a lazy constructor. A negative
+// payloadDecoderConcurrency is normalized to 0, meaning zstd's default
+// (GOMAXPROCS). Any option rejection — today only a negative
+// concurrency, but future zstd versions may validate more — is returned
+// as an error instead of being swallowed.
+func (p *BinlogParser) getPayloadDecoder() (*zstd.Decoder, error) {
+	if p.decoderPool == nil {
+		p.decoderPool = make(chan *zstd.Decoder, 1)
+	}
+
+	select {
+	case d := <-p.decoderPool:
+		return d, nil
+	default:
+	}
+
+	concurrency := p.payloadDecoderConcurrency
+	concurrency = max(concurrency, 0)
+	d, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(concurrency))
+	if err != nil {
+		return nil, errors.Wrapf(err, "create zstd payload decoder with concurrency %d", concurrency)
+	}
+	if d == nil {
+		return nil, errors.Errorf("zstd.NewReader returned nil decoder without error, concurrency %d", concurrency)
+	}
+	return d, nil
+}
+
+// putPayloadDecoder returns a decoder to the parser's decoder cache after
+// a successful decode; it is the counterpart of getPayloadDecoder. A
+// decoder that cannot be cached is closed and dropped, never silently
+// left to the GC. On a decode failure, do not call it: close and drop
+// the decoder instead, mirroring the conservative handling in
+// decodePayload.
+func (p *BinlogParser) putPayloadDecoder(d *zstd.Decoder) {
+	if d == nil {
+		return
+	}
+	if p.decoderPool == nil {
+		// cache evicted by Close; close and drop
+		d.Close()
+		return
+	}
+	select {
+	case p.decoderPool <- d:
+	default:
+		// slot already holds an idle decoder; close and drop the extra one
+		d.Close()
+	}
+}
+
+// SetPayloadDecoderConcurrency sets the concurrency for zstd decoders
+// used to decompress TransactionPayloadEvent payloads. Zero means the
+// zstd default (GOMAXPROCS); negative values are treated as zero.
+func (p *BinlogParser) SetPayloadDecoderConcurrency(concurrency int) {
+	p.payloadDecoderConcurrency = concurrency
+}
+
+func (p *BinlogParser) SetRowsEventDecodeFunc(rowsEventDecodeFunc func(*RowsEvent, []byte) error) {
+	p.rowsEventDecodeFunc = rowsEventDecodeFunc
+}
+
+func (p *BinlogParser) SetTableMapOptionalMetaDecodeFunc(tableMapOptionalMetaDecondeFunc func([]byte) error) {
+	p.tableMapOptionalMetaDecodeFunc = tableMapOptionalMetaDecondeFunc
+}
+
+// cloneForPayloadDecode returns a new BinlogParser that inherits the
+// caller's user-settable decode options (UseDecimal, RenderJSONAsMySQLText,
+// ParseTime, etc.) but with checksum verification disabled and a fresh
+// tables map. It is used to parse the events nested inside a
+// TRANSACTION_PAYLOAD_EVENT, so that those rows decode with the same
+// options as uncompressed rows.
+func (p *BinlogParser) cloneForPayloadDecode() *BinlogParser {
+	inner := NewBinlogParser()
+	inner.flavor = p.flavor
+	inner.rawMode = p.rawMode
+	inner.parseTime = p.parseTime
+	inner.timestampStringLocation = p.timestampStringLocation
+	inner.useDecimal = p.useDecimal
+	inner.useFloatWithTrailingZero = p.useFloatWithTrailingZero
+	inner.renderJSONAsMySQLText = p.renderJSONAsMySQLText
+	inner.ignoreJSONDecodeErr = p.ignoreJSONDecodeErr
+	// verifyChecksum is intentionally left at the zero value: nested
+	// events do not carry their own checksum trailers.
+	inner.payloadDecoderConcurrency = p.payloadDecoderConcurrency
+	inner.rowsEventDecodeFunc = p.rowsEventDecodeFunc
+	inner.tableMapOptionalMetaDecodeFunc = p.tableMapOptionalMetaDecodeFunc
+	return inner
+}
+
 func (p *BinlogParser) parseHeader(data []byte) (*EventHeader, error) {
 	h := new(EventHeader)
 	err := h.Decode(data)
@@ -132,7 +360,7 @@ func (p *BinlogParser) parseHeader(data []byte) (*EventHeader, error) {
 	return h, nil
 }
 
-func (p *BinlogParser) parseEvent(h *EventHeader, data []byte) (Event, error) {
+func (p *BinlogParser) parseEvent(h *EventHeader, data []byte, rawData []byte) (Event, error) {
 	var e Event
 
 	if h.EventType == FORMAT_DESCRIPTION_EVENT {
@@ -140,7 +368,14 @@ func (p *BinlogParser) parseEvent(h *EventHeader, data []byte) (Event, error) {
 		e = p.format
 	} else {
 		if p.format != nil && p.format.ChecksumAlgorithm == BINLOG_CHECKSUM_ALG_CRC32 {
-			data = data[0 : len(data)-4]
+			if len(data) < BinlogChecksumLength {
+				return nil, fmt.Errorf("invalid event %v, log pos %d: body is %d bytes, too short for the %d-byte checksum", h.EventType, h.LogPos, len(data), BinlogChecksumLength)
+			}
+			err := p.verifyCrc32Checksum(rawData)
+			if err != nil {
+				return nil, fmt.Errorf("failed checksum for %v, log pos %d: %v", h.EventType, h.LogPos, err)
+			}
+			data = data[0 : len(data)-BinlogChecksumLength]
 		}
 
 		if h.EventType == ROTATE_EVENT {
@@ -149,10 +384,17 @@ func (p *BinlogParser) parseEvent(h *EventHeader, data []byte) (Event, error) {
 			switch h.EventType {
 			case QUERY_EVENT:
 				e = &QueryEvent{}
+			case MARIADB_QUERY_COMPRESSED_EVENT:
+				e = &QueryEvent{
+					compressed: true,
+				}
 			case XID_EVENT:
 				e = &XIDEvent{}
 			case TABLE_MAP_EVENT:
-				te := &TableMapEvent{}
+				te := &TableMapEvent{
+					flavor:                 p.flavor,
+					optionalMetaDecodeFunc: p.tableMapOptionalMetaDecodeFunc,
+				}
 				if p.format.EventTypeHeaderLengths[TABLE_MAP_EVENT-1] == 6 {
 					te.tableIDSize = 4
 				} else {
@@ -167,18 +409,27 @@ func (p *BinlogParser) parseEvent(h *EventHeader, data []byte) (Event, error) {
 				UPDATE_ROWS_EVENTv1,
 				WRITE_ROWS_EVENTv2,
 				UPDATE_ROWS_EVENTv2,
-				DELETE_ROWS_EVENTv2:
+				DELETE_ROWS_EVENTv2,
+				MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1,
+				MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1,
+				MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1,
+				PARTIAL_UPDATE_ROWS_EVENT: // Extension of UPDATE_ROWS_EVENT, allowing partial values according to binlog_row_value_options
+
 				e = p.newRowsEvent(h)
 			case ROWS_QUERY_EVENT:
 				e = &RowsQueryEvent{}
 			case GTID_EVENT:
 				e = &GTIDEvent{}
+			case ANONYMOUS_GTID_EVENT:
+				e = &GTIDEvent{}
+			case GTID_TAGGED_LOG_EVENT:
+				e = &GtidTaggedLogEvent{}
 			case BEGIN_LOAD_QUERY_EVENT:
 				e = &BeginLoadQueryEvent{}
 			case EXECUTE_LOAD_QUERY_EVENT:
 				e = &ExecuteLoadQueryEvent{}
 			case MARIADB_ANNOTATE_ROWS_EVENT:
-				e = &MariadbAnnotaeRowsEvent{}
+				e = &MariadbAnnotateRowsEvent{}
 			case MARIADB_BINLOG_CHECKPOINT_EVENT:
 				e = &MariadbBinlogCheckPointEvent{}
 			case MARIADB_GTID_LIST_EVENT:
@@ -187,6 +438,16 @@ func (p *BinlogParser) parseEvent(h *EventHeader, data []byte) (Event, error) {
 				ee := &MariadbGTIDEvent{}
 				ee.GTID.ServerID = h.ServerID
 				e = ee
+			case PREVIOUS_GTIDS_EVENT:
+				e = &PreviousGTIDsEvent{}
+			case INTVAR_EVENT:
+				e = &IntVarEvent{}
+			case TRANSACTION_PAYLOAD_EVENT:
+				e = p.newTransactionPayloadEvent()
+			case HEARTBEAT_EVENT:
+				e = &HeartbeatEvent{Version: 1}
+			case HEARTBEAT_LOG_EVENT_V2:
+				e = &HeartbeatEvent{Version: 2}
 			default:
 				e = &GenericEvent{}
 			}
@@ -195,12 +456,32 @@ func (p *BinlogParser) parseEvent(h *EventHeader, data []byte) (Event, error) {
 		}
 	}
 
-	if err := e.Decode(data); err != nil {
+	var err error
+	if re, ok := e.(*RowsEvent); ok && p.rowsEventDecodeFunc != nil {
+		err = p.rowsEventDecodeFunc(re, data)
+	} else {
+		err = e.Decode(data)
+	}
+
+	if fde, ok := e.(*FormatDescriptionEvent); ok {
+		if fde.ChecksumAlgorithm == BINLOG_CHECKSUM_ALG_CRC32 {
+			err := p.verifyCrc32Checksum(rawData)
+			if err != nil {
+				return nil, fmt.Errorf("failed checksum for %v, log pos %d: %v", h.EventType, h.LogPos, err)
+			}
+		}
+	}
+
+	if err != nil {
 		return nil, &EventError{h, err.Error(), data}
 	}
 
 	if te, ok := e.(*TableMapEvent); ok {
 		p.tables[te.TableID] = te
+	}
+
+	if tpe, ok := e.(*TransactionPayloadEvent); ok {
+		tpe.stampInnerEventPositions(h)
 	}
 
 	if re, ok := e.(*RowsEvent); ok {
@@ -213,7 +494,7 @@ func (p *BinlogParser) parseEvent(h *EventHeader, data []byte) (Event, error) {
 	return e, nil
 }
 
-// Given the bytes for a a binary log event: return the decoded event.
+// Parse: Given the bytes for a a binary log event: return the decoded event.
 // With the exception of the FORMAT_DESCRIPTION_EVENT event type
 // there must have previously been passed a FORMAT_DESCRIPTION_EVENT
 // into the parser for this to work properly on any given event.
@@ -223,7 +504,6 @@ func (p *BinlogParser) Parse(data []byte) (*BinlogEvent, error) {
 	rawData := data
 
 	h, err := p.parseHeader(data)
-
 	if err != nil {
 		return nil, err
 	}
@@ -235,17 +515,39 @@ func (p *BinlogParser) Parse(data []byte) (*BinlogEvent, error) {
 		return nil, fmt.Errorf("invalid data size %d in event %s, less event length %d", len(data), h.EventType, eventLen)
 	}
 
-	e, err := p.parseEvent(h, data)
+	e, err := p.parseEvent(h, data, rawData)
 	if err != nil {
 		return nil, err
 	}
 
-	return &BinlogEvent{rawData, h, e}, nil
+	return &BinlogEvent{RawData: rawData, Header: h, Event: e}, nil
+}
+
+func (p *BinlogParser) verifyCrc32Checksum(rawData []byte) error {
+	if !p.verifyChecksum {
+		return nil
+	}
+
+	calculatedPart := rawData[0 : len(rawData)-BinlogChecksumLength]
+	expectedChecksum := rawData[len(rawData)-BinlogChecksumLength:]
+
+	// mysql use zlib's CRC32 implementation, which uses polynomial 0xedb88320UL.
+	// reference: https://github.com/madler/zlib/blob/master/crc32.c
+	// https://github.com/madler/zlib/blob/master/doc/rfc1952.txt#L419
+	checksum := crc32.ChecksumIEEE(calculatedPart)
+	computed := make([]byte, BinlogChecksumLength)
+	binary.LittleEndian.PutUint32(computed, checksum)
+	if !bytes.Equal(expectedChecksum, computed) {
+		return ErrChecksumMismatch
+	}
+	return nil
 }
 
 func (p *BinlogParser) newRowsEvent(h *EventHeader) *RowsEvent {
 	e := &RowsEvent{}
-	if p.format.EventTypeHeaderLengths[h.EventType-1] == 6 {
+
+	postHeaderLen := p.format.EventTypeHeaderLengths[h.EventType-1]
+	if postHeaderLen == 6 {
 		e.tableIDSize = 4
 	} else {
 		e.tableIDSize = 6
@@ -253,7 +555,13 @@ func (p *BinlogParser) newRowsEvent(h *EventHeader) *RowsEvent {
 
 	e.needBitmap2 = false
 	e.tables = p.tables
+	e.eventType = h.EventType
 	e.parseTime = p.parseTime
+	e.timestampStringLocation = p.timestampStringLocation
+	e.useDecimal = p.useDecimal
+	e.useFloatWithTrailingZero = p.useFloatWithTrailingZero
+	e.renderJSONAsMySQLText = p.renderJSONAsMySQLText
+	e.ignoreJSONDecodeErr = p.ignoreJSONDecodeErr
 
 	switch h.EventType {
 	case WRITE_ROWS_EVENTv0:
@@ -269,6 +577,16 @@ func (p *BinlogParser) newRowsEvent(h *EventHeader) *RowsEvent {
 	case UPDATE_ROWS_EVENTv1:
 		e.Version = 1
 		e.needBitmap2 = true
+	case MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
+		e.Version = 1
+		e.compressed = true
+	case MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
+		e.Version = 1
+		e.compressed = true
+	case MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
+		e.Version = 1
+		e.compressed = true
+		e.needBitmap2 = true
 	case WRITE_ROWS_EVENTv2:
 		e.Version = 2
 	case UPDATE_ROWS_EVENTv2:
@@ -276,7 +594,18 @@ func (p *BinlogParser) newRowsEvent(h *EventHeader) *RowsEvent {
 		e.needBitmap2 = true
 	case DELETE_ROWS_EVENTv2:
 		e.Version = 2
+	case PARTIAL_UPDATE_ROWS_EVENT:
+		e.Version = 2
+		e.needBitmap2 = true
 	}
+
+	return e
+}
+
+func (p *BinlogParser) newTransactionPayloadEvent() *TransactionPayloadEvent {
+	e := &TransactionPayloadEvent{}
+	e.format = *p.format
+	e.parent = p
 
 	return e
 }

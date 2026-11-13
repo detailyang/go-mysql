@@ -1,0 +1,246 @@
+package client
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/test_util"
+)
+
+type connTestSuite struct {
+	suite.Suite
+	c    *Conn
+	port string
+}
+
+func TestConnSuite(t *testing.T) {
+	segs := strings.SplitSeq(*test_util.MysqlPort, ",")
+	for seg := range segs {
+		suite.Run(t, &connTestSuite{port: seg})
+	}
+}
+
+func (s *connTestSuite) SetupSuite() {
+	var err error
+	addr := fmt.Sprintf("%s:%s", *test_util.MysqlHost, s.port)
+	s.c, err = Connect(addr, *testUser, *testPassword, "", func(c *Conn) error {
+		// required for the ExecuteMultiple test
+		err = c.SetCapability(mysql.CLIENT_MULTI_STATEMENTS)
+		c.SetAttributes(map[string]string{"attrtest": "attrvalue"})
+		return err
+	})
+	require.NoError(s.T(), err)
+
+	_, err = s.c.Execute("CREATE DATABASE IF NOT EXISTS " + *testDB)
+	require.NoError(s.T(), err)
+
+	_, err = s.c.Execute("USE " + *testDB)
+	require.NoError(s.T(), err)
+
+	s.testExecuteCreateTable()
+}
+
+func (s *connTestSuite) TearDownSuite() {
+	if s.c == nil {
+		return
+	}
+
+	s.testExecuteDropTable()
+
+	if s.c != nil {
+		s.c.Close()
+	}
+}
+
+var (
+	testExecuteSelectStreamingRows      = [...]string{"foo", "helloworld", "bar", "", "spam"}
+	testExecuteSelectStreamingTablename = "execute_plain_table"
+)
+
+func (s *connTestSuite) testExecuteCreateTable() {
+	str := `CREATE TABLE IF NOT EXISTS ` + testExecuteSelectStreamingTablename + ` (
+          id INT UNSIGNED NOT NULL,
+          str VARCHAR(256),
+          PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+
+	result, err := s.c.Execute(str)
+	require.NoError(s.T(), err)
+	result.Close()
+
+	result, err = s.c.Execute(`TRUNCATE TABLE ` + testExecuteSelectStreamingTablename)
+	require.NoError(s.T(), err)
+	result.Close()
+
+	stmt, err := s.c.Prepare(`INSERT INTO ` + testExecuteSelectStreamingTablename + ` (id, str) VALUES (?, ?)`)
+	require.NoError(s.T(), err)
+	defer stmt.Close()
+
+	for id, str := range testExecuteSelectStreamingRows {
+		result, err := stmt.Execute(id, str)
+		require.NoError(s.T(), err)
+		result.Close()
+	}
+}
+
+func (s *connTestSuite) testExecuteDropTable() {
+	_, err := s.c.Execute(`drop table if exists ` + testExecuteSelectStreamingTablename)
+	require.NoError(s.T(), err)
+}
+
+func (s *connTestSuite) TestFieldList() {
+	fields, err := s.c.FieldList(testExecuteSelectStreamingTablename, "")
+	require.NoError(s.T(), err)
+	require.Len(s.T(), fields, 2)
+}
+
+func (s *connTestSuite) TestExecuteMultiple() {
+	queries := []string{
+		`INSERT INTO ` + testExecuteSelectStreamingTablename + ` (id, str) VALUES (999, "executemultiple")`,
+		`SELECT id FROM ` + testExecuteSelectStreamingTablename + ` LIMIT 2`,
+		`DELETE FROM ` + testExecuteSelectStreamingTablename + ` WHERE id=999`,
+		`THIS IS BOGUS()`,
+	}
+
+	_, err := s.c.Execute("USE " + *testDB)
+	require.Nil(s.T(), err)
+
+	count := 0
+	result, err := s.c.ExecuteMultiple(strings.Join(queries, "; "), func(result *mysql.Result, err error) {
+		switch count {
+		case 0, 2:
+			// the INSERT/DELETE query have empty resultset, but should have set affectedrows
+			// the err should be nil
+			// also, since this is not the last query, the SERVER_MORE_RESULTS_EXISTS
+			// flag should be set
+			require.True(s.T(), result.Status&mysql.SERVER_MORE_RESULTS_EXISTS > 0)
+			require.Equal(s.T(), 0, result.RowNumber())
+			require.Equal(s.T(), uint64(1), result.AffectedRows)
+			require.NoError(s.T(), err)
+		case 1:
+			// the SELECT query should have an resultset
+			// still not the last query, flag should be set
+			require.True(s.T(), result.Status&mysql.SERVER_MORE_RESULTS_EXISTS > 0)
+			require.Greater(s.T(), result.RowNumber(), 0)
+			require.NoError(s.T(), err)
+		case 3:
+			// this query is obviously bogus so the error should be non-nil
+			require.Nil(s.T(), result)
+			require.Error(s.T(), err)
+		}
+		count++
+	})
+
+	require.Equal(s.T(), 4, count)
+	require.NoError(s.T(), err)
+	require.True(s.T(), result.StreamingDone)
+	require.Equal(s.T(), mysql.StreamingMultiple, result.Streaming)
+}
+
+func (s *connTestSuite) TestExecuteSelectStreaming() {
+	var (
+		expectedRowID                int64
+		perResultCallbackCalledTimes int
+		result                       mysql.Result
+	)
+
+	const colsInResult = 2 // id, str
+
+	err := s.c.ExecuteSelectStreaming(`SELECT id, str FROM `+testExecuteSelectStreamingTablename+` ORDER BY id`,
+		&result,
+		func(row []mysql.FieldValue) error {
+			// Check number of columns
+			require.Len(s.T(), row, colsInResult)
+			// Check type of columns
+			require.Equal(s.T(), mysql.FieldValueType(mysql.FieldValueTypeUnsigned), row[0].Type)
+			require.Equal(s.T(), mysql.FieldValueType(mysql.FieldValueTypeString), row[1].Type)
+
+			id := row[0].AsInt64()
+			str := row[1].AsString()
+
+			// Check order of rows
+			require.Equal(s.T(), expectedRowID, id)
+			// Check string values (protection from incorrect reuse of memory)
+			require.Equal(s.T(), testExecuteSelectStreamingRows[id], string(str))
+
+			expectedRowID++
+
+			return nil
+		}, func(result *mysql.Result) error {
+			// result.Resultset must be defined at this point
+			require.NotNil(s.T(), result.Resultset)
+			// Check number of columns
+			require.Len(s.T(), result.Fields, colsInResult)
+
+			perResultCallbackCalledTimes++
+			return nil
+		})
+	require.NoError(s.T(), err)
+
+	// Check total rows count
+	require.Equal(s.T(), int64(len(testExecuteSelectStreamingRows)), expectedRowID)
+
+	// Check perResultCallback call count
+	require.Equal(s.T(), 1, perResultCallbackCalledTimes)
+}
+
+func (s *connTestSuite) TestAttributes() {
+	// Test that both custom attributes and library set attributes are visible
+	require.Equal(s.T(), "go-mysql", s.c.attributes["_client_name"])
+	require.Equal(s.T(), "attrvalue", s.c.attributes["attrtest"])
+}
+
+func (s *connTestSuite) TestSetQueryAttributes() {
+	qa := mysql.QueryAttribute{
+		Name:  "qattr1",
+		Value: "qattr1val",
+	}
+	err := s.c.SetQueryAttributes(qa)
+	require.NoError(s.T(), err)
+	expected := []mysql.QueryAttribute{
+		{
+			Name:  "qattr1",
+			Value: "qattr1val",
+		},
+	}
+	require.Equal(s.T(), expected, s.c.queryAttributes)
+}
+
+func (s *connTestSuite) TestUseDB() {
+	_, err := s.c.Execute("create database if not exists proxier;")
+	require.NoError(s.T(), err)
+	err = s.c.UseDB("proxier")
+	require.NoError(s.T(), err)
+	result, err := s.c.Execute("select database();")
+	require.NoError(s.T(), err)
+	value, err := result.GetString(0, 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), "proxier", value)
+	_, err = s.c.Execute("drop database proxier;")
+	require.NoError(s.T(), err)
+	_, err = s.c.Execute("create database proxier;")
+	require.NoError(s.T(), err)
+	err = s.c.UseDB("proxier")
+	require.NoError(s.T(), err)
+	result, err = s.c.Execute("select database();")
+	require.NoError(s.T(), err)
+	value, err = result.GetString(0, 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), "proxier", value)
+	_, err = s.c.Execute("drop database proxier;")
+	require.NoError(s.T(), err)
+	err = s.c.UseDB("test")
+	require.NoError(s.T(), err)
+}
+
+func TestCapabilityString(t *testing.T) {
+	conn := Conn{
+		capability: mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_DEPRECATE_EOF,
+	}
+	require.Equal(t, "CLIENT_PROTOCOL_41|CLIENT_DEPRECATE_EOF", conn.CapabilityString())
+}

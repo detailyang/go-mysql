@@ -1,0 +1,170 @@
+name: runTestsAndLinters
+on: [push, pull_request]
+
+permissions:
+  contents: read
+  # Write is needed for golangci-lint annotations
+  checks: write
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        go: [ "1.27", "1.26" ]
+        os: [ ubuntu-latest, ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm ]
+    name: Tests Go ${{ matrix.go }} on ${{ matrix.os }} # This name is used in main branch protection rules
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Setup MySQL
+        run: |
+          echo -n "mysql -V: " ; mysql -V
+          echo -n "mysqldump -V: " ; mysqldump -V
+
+          echo -e '[mysqld]\nserver-id=1\nlog-bin=mysql\nbinlog-format=row\ngtid-mode=ON\nenforce_gtid_consistency=ON\n' | sudo tee /etc/mysql/conf.d/replication.cnf
+
+          # Ubuntu's MySQL 8.4 package disables mysql_native_password by default.
+          if mysql -V | grep -q '8\.4\.'; then
+            echo 'mysql_native_password=ON' | sudo tee -a /etc/mysql/conf.d/replication.cnf
+          fi
+
+          # bind to :: for dual-stack listening
+          sudo sed -i 's/bind-address.*= 127.0.0.1/bind-address = ::/' /etc/mysql/mysql.conf.d/mysqld.cnf
+          sudo sed -i 's/mysqlx-bind-address.*= 127.0.0.1/mysqlx-bind-address = ::/' /etc/mysql/mysql.conf.d/mysqld.cnf
+
+          sudo service mysql start
+
+          # apply this for mysql5 & mysql8 compatibility
+          sudo mysql -h 127.0.0.1 -uroot -proot -e "DROP USER IF EXISTS 'mysql.infoschema'@'localhost'; CREATE USER IF NOT EXISTS 'mysql.infoschema'@'localhost' IDENTIFIED BY ''; GRANT SELECT ON *.* TO 'mysql.infoschema'@'localhost';"
+
+          sudo mysql -h 127.0.0.1 -uroot -proot -e "use mysql; update user set authentication_string=null where User='root'; update user set plugin='mysql_native_password'; FLUSH PRIVILEGES;"
+          mysql -e "CREATE DATABASE IF NOT EXISTS test;" -uroot
+          mysql -e "SHOW VARIABLES LIKE 'log_bin'" -uroot
+      - name: Prepare for Go
+        run: |
+          sudo apt-get install -y make gcc
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Run tests
+        run: |
+          # separate test to avoid RESET MASTER conflict
+          go test -race $(go list ./... | grep -v canal)
+          go test -race $(go list ./... | grep canal)
+
+  mysqltest:
+    strategy:
+      matrix:
+        mysql_version:
+          - 8.0.45
+          - 8.4.8
+          - 9.7.0
+    name: Tests with MySQL ${{ matrix.mysql_version }}
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql_version }}
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: yes
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+      - name: MySQL versions
+        run: |
+          echo -n "mysql -v: " ; mysql -V
+          echo -n "mysqldump -V: " ; mysqldump -V
+          echo -n "MySQL Server (SELECT VERSION()): " ; mysql -h 127.0.0.1 -u root -BNe 'SELECT VERSION()'
+      - name: Prepare for Go
+        run: |
+          sudo apt-get install -y make gcc
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Run tests
+        run: |
+          # separate test to avoid RESET MASTER conflict
+          # TODO: Fix "dump/" and "canal/": mysqldump tries to run SHOW MASTER STATUS on v8.4.0
+          go test $(go list ./... | grep -v canal | grep -v dump)
+          # go test $(go list ./... | grep canal | grep -v dump)
+
+  mariadbtest:
+    strategy:
+      fail-fast: false
+      matrix:
+        mariadb_version:
+          - 10.11.18
+          - 11.4.12
+          - 11.8.8
+    name: Tests with MariaDB ${{ matrix.mariadb_version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make gcc mariadb-client
+          mariadb-dump --version
+      - name: Start MariaDB
+        run: make MARIADB_VERSION=${{ matrix.mariadb_version }} mariadb-start
+      - name: MariaDB version
+        run: mariadb -h 127.0.0.1 -u root -BNe 'SELECT VERSION()'
+      - name: Run tests
+        run: make test-local-mariadb
+      - name: Stop MariaDB
+        if: always()
+        run: make mariadb-stop
+
+  golangci:
+    name: golangci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          # Keep the Go toolchain compatible with the pinned linter below.
+          go-version: "1.26"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # v2.13.1's goimports and gofumpt disagree on mysql/errname.go when
+          # the linter is built with Go 1.27, so no formatting satisfies both.
+          version: v2.12.2
+          args: --timeout=3m
+
+  platforms:
+    strategy:
+      matrix:
+        arch: [ "amd64", "arm64", "arm" ]
+        os: [ "linux", "freebsd", "darwin" ]
+        exclude:
+          - arch: "arm"
+            os: "darwin"
+    name: platforms
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare for Go
+        run: |
+          sudo apt-get install -y make gcc
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Build on ${{ matrix.os }}/${{ matrix.arch }}
+        run: GOARCH=${{ matrix.arch }} GOOS=${{ matrix.os }} go build ./...

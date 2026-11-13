@@ -1,0 +1,103 @@
+package canal
+
+import (
+	"testing"
+
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/schema"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRowsEvent_handleUnsigned(t *testing.T) {
+	type fields struct {
+		Table  *schema.Table
+		Action string
+		Rows   [][]any
+		Header *replication.EventHeader
+	}
+	tests := []struct {
+		name     string
+		fields   fields
+		wantRows [][]any
+	}{
+		{
+			name: "rows_event_handle_unsigned",
+			fields: fields{
+				Table: &schema.Table{
+					// columns 1,3,5,7,9 should be converted from signed to unsigned,
+					// column 10 is out of range and should be ignored, don't panic.
+					UnsignedColumns: []int{1, 3, 5, 7, 9, 10},
+				},
+				Rows: [][]any{
+					{
+						int8(8), int8(8),
+						int16(16), int16(16),
+						int32(32), int32(32),
+						int64(64), int64(64),
+						int(128), int(128),
+					},
+				},
+			},
+			wantRows: [][]any{
+				{
+					int8(8), uint8(8),
+					int16(16), uint16(16),
+					int32(32), uint32(32),
+					int64(64), uint64(64),
+					int(128), uint(128),
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &RowsEvent{
+				Table:  tt.fields.Table,
+				Action: tt.fields.Action,
+				Rows:   tt.fields.Rows,
+				Header: tt.fields.Header,
+			}
+			r.handleUnsigned()
+			require.Equal(t, tt.fields.Rows, tt.wantRows)
+		})
+	}
+}
+
+// TestRowsEvent_flags checks if Flags from replication's RowsEvent propagate to canal's RowsEvent.
+func TestRowsEvent_flags(t *testing.T) {
+	replEvent := &replication.RowsEvent{
+		Flags: 0x15,
+	}
+
+	var table schema.Table
+	canalEvent := newRowsEvent(&table, "update", nil, nil, replEvent)
+
+	require.Equal(t, canalEvent.Flags, replEvent.Flags)
+}
+
+// TestRowsEvent_skippedColumns checks that SkippedColumns from replication's
+// RowsEvent propagate to canal's RowsEvent, so a handler can tell a column
+// missing from a partial row image apart from one that is NULL.
+func TestRowsEvent_skippedColumns(t *testing.T) {
+	replEvent := &replication.RowsEvent{
+		Rows: [][]any{
+			{1, nil, "a"},
+			{2, "b", nil},
+		},
+		SkippedColumns: [][]int{
+			{1},
+			{},
+		},
+	}
+
+	var table schema.Table
+	canalEvent := newRowsEvent(&table, "update", replEvent.Rows, nil, replEvent)
+
+	require.Equal(t, replEvent.SkippedColumns, canalEvent.SkippedColumns)
+	require.Len(t, canalEvent.SkippedColumns, len(canalEvent.Rows))
+
+	// A dump builds its event without a replication.RowsEvent, so it has no
+	// skipped columns to report.
+	dumpEvent := newRowsEvent(&table, "insert", [][]any{{1, "a"}}, nil, nil)
+	require.Nil(t, dumpEvent.SkippedColumns)
+}

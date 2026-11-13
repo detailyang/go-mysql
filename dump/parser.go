@@ -6,31 +6,31 @@ import (
 	"io"
 	"regexp"
 	"strconv"
+	"strings"
 
-	"github.com/juju/errors"
-	"github.com/siddontang/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/pingcap/errors"
 )
 
-var (
-	ErrSkip = errors.New("Handler error, but skipped")
-)
+var ErrSkip = errors.New("Handler error, but skipped")
 
 type ParseHandler interface {
 	// Parse CHANGE MASTER TO MASTER_LOG_FILE=name, MASTER_LOG_POS=pos;
 	BinLog(name string, pos uint64) error
-
+	GtidSet(gtidsets string) error
 	Data(schema string, table string, values []string) error
 }
 
-var binlogExp *regexp.Regexp
-var useExp *regexp.Regexp
-var valuesExp *regexp.Regexp
-
-func init() {
-	binlogExp = regexp.MustCompile("^CHANGE MASTER TO MASTER_LOG_FILE='(.+)', MASTER_LOG_POS=(\\d+);")
-	useExp = regexp.MustCompile("^USE `(.+)`;")
+var (
+	binlogExp = regexp.MustCompile(`^CHANGE (MASTER|REPLICATION SOURCE) TO (MASTER_LOG_FILE|SOURCE_LOG_FILE)='(.+)', (MASTER_LOG_POS|SOURCE_LOG_POS)=(\d+);`)
+	useExp    = regexp.MustCompile("^USE `(.+)`;")
 	valuesExp = regexp.MustCompile("^INSERT INTO `(.+?)` VALUES \\((.+)\\);$")
-}
+
+	// The pattern will only match MySQL GTID, as you know SET GLOBAL gtid_slave_pos='0-1-4' is used for MariaDB.
+	// SET @@GLOBAL.GTID_PURGED='1638041a-0457-11e9-bb9f-00505690b730:1-429405150:foo:1-4';
+	// https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html
+	gtidExp = regexp.MustCompile(`(\w{8}(-\w{4}){3}-\w{12}(:\d+(-\d+)?|:[a-z_][a-z0-9_]{0,31})+)`)
+)
 
 // Parse the dump data with Dumper generate.
 // It can not parse all the data formats with mysqldump outputs
@@ -48,12 +48,25 @@ func Parse(r io.Reader, h ParseHandler, parseBinlogPos bool) error {
 			break
 		}
 
-		line = line[0 : len(line)-1]
+		// Ignore '\n' on Linux or '\r\n' on Windows
+		line = strings.TrimRightFunc(line, func(c rune) bool {
+			return c == '\r' || c == '\n'
+		})
 
 		if parseBinlogPos && !binlogParsed {
+			// parsed gtid set from mysqldump
+			// gtid comes before binlog file-position
+			if m := gtidExp.FindAllStringSubmatch(line, -1); len(m) == 1 {
+				gtidStr := m[0][1]
+				if gtidStr != "" {
+					if err := h.GtidSet(gtidStr); err != nil {
+						return errors.Trace(err)
+					}
+				}
+			}
 			if m := binlogExp.FindAllStringSubmatch(line, -1); len(m) == 1 {
-				name := m[0][1]
-				pos, err := strconv.ParseUint(m[0][2], 10, 64)
+				name := m[0][3]
+				pos, err := strconv.ParseUint(m[0][5], 10, 64)
 				if err != nil {
 					return errors.Errorf("parse binlog %v err, invalid number", line)
 				}
@@ -88,7 +101,7 @@ func Parse(r io.Reader, h ParseHandler, parseBinlogPos bool) error {
 }
 
 func parseValues(str string) ([]string, error) {
-	// values are seperated by comma, but we can not split using comma directly
+	// values are separated by comma, but we can not split using comma directly
 	// string is enclosed by single quote
 
 	// a simple implementation, may be more robust later.
@@ -100,7 +113,8 @@ func parseValues(str string) ([]string, error) {
 		if str[i] != '\'' {
 			// no string, read until comma
 			j := i + 1
-			for ; j < len(str) && str[j] != ','; j++ {
+			for j < len(str) && str[j] != ',' {
+				j++
 			}
 			values = append(values, str[i:j])
 			// skip ,
@@ -118,9 +132,8 @@ func parseValues(str string) ([]string, error) {
 					continue
 				} else if str[j] == '\'' {
 					break
-				} else {
-					j++
 				}
+				j++
 			}
 
 			if j >= len(str) {

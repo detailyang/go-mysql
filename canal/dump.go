@@ -1,26 +1,40 @@
 package canal
 
 import (
+	"encoding/hex"
+	"fmt"
+	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/siddontang/go-mysql/dump"
-	"github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/schema"
-	log "github.com/sirupsen/logrus"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/schema"
+	"github.com/go-mysql-org/go-mysql/utils"
+	"github.com/pingcap/errors"
+	"github.com/shopspring/decimal"
 )
 
 type dumpParseHandler struct {
 	c    *Canal
 	name string
 	pos  uint64
+	gset mysql.GTIDSet
 }
 
 func (h *dumpParseHandler) BinLog(name string, pos uint64) error {
 	h.name = name
 	h.pos = pos
 	return nil
+}
+
+func (h *dumpParseHandler) GtidSet(gtidsets string) (err error) {
+	if h.gset != nil {
+		err = h.gset.Update(gtidsets)
+	} else {
+		h.gset, err = mysql.ParseGTIDSet("mysql", gtidsets)
+	}
+	return err
 }
 
 func (h *dumpParseHandler) Data(db string, table string, values []string) error {
@@ -36,40 +50,68 @@ func (h *dumpParseHandler) Data(db string, table string, values []string) error 
 			e == schema.ErrMissingTableMeta {
 			return nil
 		}
-		log.Errorf("get %s.%s information err: %v", db, table, err)
+		h.c.cfg.Logger.Error("error getting table information", slog.String("database", db), slog.String("table", table), slog.Any("error", err))
 		return errors.Trace(err)
 	}
 
-	vs := make([]interface{}, len(values))
+	vs := make([]any, len(values))
 
 	for i, v := range values {
 		if v == "NULL" {
 			vs[i] = nil
+		} else if v == "_binary ''" {
+			vs[i] = []byte{}
 		} else if v[0] != '\'' {
-			if tableInfo.Columns[i].Type == schema.TYPE_NUMBER {
-				n, err := strconv.ParseInt(v, 10, 64)
-				if err != nil {
-					log.Errorf("parse row %v at %d error %v, skip", values, i, err)
-					return dump.ErrSkip
+			if tableInfo.Columns[i].Type == schema.TYPE_NUMBER || tableInfo.Columns[i].Type == schema.TYPE_MEDIUM_INT {
+				var n any
+				var err error
+
+				if tableInfo.Columns[i].IsUnsigned {
+					n, err = strconv.ParseUint(v, 10, 64)
+				} else {
+					n, err = strconv.ParseInt(v, 10, 64)
 				}
+
+				if err != nil {
+					return fmt.Errorf("parse row %v at %d error %v, int expected", values, i, err)
+				}
+
 				vs[i] = n
 			} else if tableInfo.Columns[i].Type == schema.TYPE_FLOAT {
 				f, err := strconv.ParseFloat(v, 64)
 				if err != nil {
-					log.Errorf("parse row %v at %d error %v, skip", values, i, err)
-					return dump.ErrSkip
+					return fmt.Errorf("parse row %v at %d error %v, float expected", values, i, err)
 				}
 				vs[i] = f
+			} else if tableInfo.Columns[i].Type == schema.TYPE_DECIMAL {
+				if h.c.cfg.UseDecimal {
+					d, err := decimal.NewFromString(v)
+					if err != nil {
+						return fmt.Errorf("parse row %v at %d error %v, decimal expected", values, i, err)
+					}
+					vs[i] = d
+				} else {
+					f, err := strconv.ParseFloat(v, 64)
+					if err != nil {
+						return fmt.Errorf("parse row %v at %d error %v, float expected", values, i, err)
+					}
+					vs[i] = f
+				}
+			} else if strings.HasPrefix(v, "0x") {
+				buf, err := hex.DecodeString(v[2:])
+				if err != nil {
+					return fmt.Errorf("parse row %v at %d error %v, hex literal expected", values, i, err)
+				}
+				vs[i] = string(buf)
 			} else {
-				log.Errorf("parse row %v error, invalid type at %d, skip", values, i)
-				return dump.ErrSkip
+				return fmt.Errorf("parse row %v error, invalid type at %d", values, i)
 			}
 		} else {
 			vs[i] = v[1 : len(v)-1]
 		}
 	}
 
-	events := newRowsEvent(tableInfo, InsertAction, [][]interface{}{vs})
+	events := newRowsEvent(tableInfo, InsertAction, [][]any{vs}, nil, nil)
 	return h.c.eventHandler.OnRow(events)
 }
 
@@ -97,43 +139,71 @@ func (c *Canal) AddDumpIgnoreTables(db string, tables ...string) {
 	c.dumper.AddIgnoreTables(db, tables...)
 }
 
-func (c *Canal) tryDump() error {
-	pos := c.master.Position()
-	gtid := c.master.GTID()
-	if (len(pos.Name) > 0 && pos.Pos > 0) || gtid != nil {
-		// we will sync with binlog name and position
-		log.Infof("skip dump, use last binlog replication pos %s or GTID %s", pos, gtid)
-		return nil
+func (c *Canal) dump() error {
+	if c.dumper == nil {
+		return errors.New("mysqldump does not exist")
 	}
 
-	if c.dumper == nil {
-		log.Info("skip dump, no mysqldump")
-		return nil
-	}
+	c.master.UpdateTimestamp(uint32(utils.Now().Unix()))
 
 	h := &dumpParseHandler{c: c}
+	// If users call StartFromGTID with empty position to start dumping with gtid,
+	// we record the current gtid position before dump starts.
+	//
+	// See tryDump() to see when dump is skipped.
+	if c.master.GTIDSet() != nil {
+		gset, err := c.GetMasterGTIDSet()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		h.gset = gset
+	}
 
 	if c.cfg.Dump.SkipMasterData {
 		pos, err := c.GetMasterPos()
 		if err != nil {
 			return errors.Trace(err)
 		}
-		log.Infof("skip master data, get current binlog position %v", pos)
+		c.cfg.Logger.Info("skip master data, get current binlog position", slog.Any("position", pos))
 		h.name = pos.Name
 		h.pos = uint64(pos.Pos)
 	}
 
-	start := time.Now()
-	log.Info("try dump MySQL and parse")
+	start := utils.Now()
+	c.cfg.Logger.Info("try dump MySQL and parse")
 	if err := c.dumper.DumpAndParse(h); err != nil {
 		return errors.Trace(err)
 	}
 
-	log.Infof("dump MySQL and parse OK, use %0.2f seconds, start binlog replication at (%s, %d)",
-		time.Now().Sub(start).Seconds(), h.name, h.pos)
-
-	pos = mysql.Position{h.name, uint32(h.pos)}
+	pos := mysql.Position{Name: h.name, Pos: uint32(h.pos)}
 	c.master.Update(pos)
-	c.eventHandler.OnPosSynced(pos, true)
+	c.master.UpdateGTIDSet(h.gset)
+	if err := c.eventHandler.OnPosSynced(nil, pos, c.master.GTIDSet(), true); err != nil {
+		return errors.Trace(err)
+	}
+	var startPos fmt.Stringer = pos
+	if h.gset != nil {
+		c.master.UpdateGTIDSet(h.gset)
+		startPos = h.gset
+	}
+	c.cfg.Logger.Info("dump MySQL and parse OK", slog.Duration("use", time.Since(start)), slog.String("position", startPos.String()))
 	return nil
+}
+
+func (c *Canal) tryDump() error {
+	pos := c.master.Position()
+	gset := c.master.GTIDSet()
+	if (len(pos.Name) > 0 && pos.Pos > 0) ||
+		(gset != nil && gset.String() != "") {
+		// we will sync with binlog name and position
+		c.cfg.Logger.Info("skip dump, use last binlog replication position or GTID set", slog.String("file", pos.Name), slog.Uint64("position", uint64(pos.Pos)), slog.Any("GTID set", gset))
+		return nil
+	}
+
+	if c.dumper == nil {
+		c.cfg.Logger.Info("skip dump, no mysqldump")
+		return nil
+	}
+
+	return c.dump()
 }

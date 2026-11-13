@@ -1,10 +1,10 @@
 package canal
 
 import (
+	"log/slog"
 	"sync"
 
-	log "github.com/sirupsen/logrus"
-	"github.com/siddontang/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
 type masterInfo struct {
@@ -12,22 +12,34 @@ type masterInfo struct {
 
 	pos mysql.Position
 
-	gtid mysql.GTIDSet
+	gset mysql.GTIDSet
+
+	timestamp uint32
+
+	logger *slog.Logger
 }
 
 func (m *masterInfo) Update(pos mysql.Position) {
-	log.Debugf("update master position %s", pos)
+	m.logger.Debug("update master position", slog.Any("pos", pos))
 
 	m.Lock()
 	m.pos = pos
 	m.Unlock()
 }
 
-func (m *masterInfo) UpdateGTID(gtid mysql.GTIDSet) {
-	log.Debugf("update master gtid %s", gtid.String())
+func (m *masterInfo) UpdateTimestamp(ts uint32) {
+	m.logger.Debug("update master timestamp", slog.Int64("ts", int64(ts)))
 
 	m.Lock()
-	m.gtid = gtid
+	m.timestamp = ts
+	m.Unlock()
+}
+
+func (m *masterInfo) UpdateGTIDSet(gset mysql.GTIDSet) {
+	m.logger.Debug("update master gtid set", slog.Any("gset", gset))
+
+	m.Lock()
+	m.gset = gset
 	m.Unlock()
 }
 
@@ -38,9 +50,19 @@ func (m *masterInfo) Position() mysql.Position {
 	return m.pos
 }
 
-func (m *masterInfo) GTID() mysql.GTIDSet {
+func (m *masterInfo) Timestamp() uint32 {
 	m.RLock()
 	defer m.RUnlock()
 
-	return m.gtid
+	return m.timestamp
+}
+
+func (m *masterInfo) GTIDSet() mysql.GTIDSet {
+	m.RLock()
+	defer m.RUnlock()
+
+	if m.gset == nil {
+		return nil
+	}
+	return m.gset.Clone()
 }

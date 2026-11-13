@@ -2,6 +2,11 @@ package mysql
 
 import (
 	"encoding/binary"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/go-mysql-org/go-mysql/utils"
 )
 
 type FieldData []byte
@@ -23,98 +28,128 @@ type Field struct {
 	DefaultValue       []byte
 }
 
-func (p FieldData) Parse() (f *Field, err error) {
-	f = new(Field)
+type FieldValueType uint8
 
+type FieldValue struct {
+	Type  FieldValueType
+	value uint64 // Also for int64 and float64
+	str   []byte
+}
+
+const (
+	FieldValueTypeNull = iota
+	FieldValueTypeUnsigned
+	FieldValueTypeSigned
+	FieldValueTypeFloat
+	FieldValueTypeString
+)
+
+func NewFieldValue(t FieldValueType, v uint64, str []byte) FieldValue {
+	return FieldValue{
+		Type:  t,
+		value: v,
+		str:   str,
+	}
+}
+
+func (f *Field) Parse(p FieldData) (err error) {
 	f.Data = p
 
 	var n int
 	pos := 0
-	//skip catelog, always def
-	n, err = SkipLengthEnodedString(p)
+	// skip catelog, always def
+	n, err = SkipLengthEncodedString(p)
 	if err != nil {
-		return
+		return err
 	}
 	pos += n
 
-	//schema
-	f.Schema, _, n, err = LengthEnodedString(p[pos:])
+	// schema
+	f.Schema, _, n, err = LengthEncodedString(p[pos:])
 	if err != nil {
-		return
+		return err
 	}
 	pos += n
 
-	//table
-	f.Table, _, n, err = LengthEnodedString(p[pos:])
+	// table
+	f.Table, _, n, err = LengthEncodedString(p[pos:])
 	if err != nil {
-		return
+		return err
 	}
 	pos += n
 
-	//org_table
-	f.OrgTable, _, n, err = LengthEnodedString(p[pos:])
+	// org_table
+	f.OrgTable, _, n, err = LengthEncodedString(p[pos:])
 	if err != nil {
-		return
+		return err
 	}
 	pos += n
 
-	//name
-	f.Name, _, n, err = LengthEnodedString(p[pos:])
+	// name
+	f.Name, _, n, err = LengthEncodedString(p[pos:])
 	if err != nil {
-		return
+		return err
 	}
 	pos += n
 
-	//org_name
-	f.OrgName, _, n, err = LengthEnodedString(p[pos:])
+	// org_name
+	f.OrgName, _, n, err = LengthEncodedString(p[pos:])
 	if err != nil {
-		return
+		return err
 	}
 	pos += n
 
-	//skip oc
-	pos += 1
+	// skip oc
+	pos++
 
-	//charset
+	// charset
 	f.Charset = binary.LittleEndian.Uint16(p[pos:])
 	pos += 2
 
-	//column length
+	// column length
 	f.ColumnLength = binary.LittleEndian.Uint32(p[pos:])
 	pos += 4
 
-	//type
+	// type
 	f.Type = p[pos]
 	pos++
 
-	//flag
+	// flag
 	f.Flag = binary.LittleEndian.Uint16(p[pos:])
 	pos += 2
 
-	//decimals 1
+	// decimals 1
 	f.Decimal = p[pos]
 	pos++
 
-	//filter [0x00][0x00]
+	// filter [0x00][0x00]
 	pos += 2
 
 	f.DefaultValue = nil
-	//if more data, command was field list
+	// if more data, command was field list
 	if len(p) > pos {
-		//length of default value lenenc-int
+		// length of default value lenenc-int
 		f.DefaultValueLength, _, n = LengthEncodedInt(p[pos:])
 		pos += n
 
 		if pos+int(f.DefaultValueLength) > len(p) {
 			err = ErrMalformPacket
-			return
+			return err
 		}
 
-		//default value string[$len]
+		// default value string[$len]
 		f.DefaultValue = p[pos:(pos + int(f.DefaultValueLength))]
 	}
 
-	return
+	return nil
+}
+
+func (p FieldData) Parse() (f *Field, err error) {
+	f = new(Field)
+	if err = f.Parse(p); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 func (f *Field) Dump() []byte {
@@ -122,7 +157,7 @@ func (f *Field) Dump() []byte {
 		f = &Field{}
 	}
 	if f.Data != nil {
-		return []byte(f.Data)
+		return f.Data
 	}
 
 	l := len(f.Schema) + len(f.Table) + len(f.OrgTable) + len(f.Name) + len(f.OrgName) + len(f.DefaultValue) + 48
@@ -154,4 +189,67 @@ func (f *Field) Dump() []byte {
 	}
 
 	return data
+}
+
+func (fv *FieldValue) AsUint64() uint64 {
+	return fv.value
+}
+
+func (fv *FieldValue) AsInt64() int64 {
+	return utils.Uint64ToInt64(fv.value)
+}
+
+func (fv *FieldValue) AsFloat64() float64 {
+	return utils.Uint64ToFloat64(fv.value)
+}
+
+// AsString returns the string value as bytes, or nil for NULL.
+func (fv *FieldValue) AsString() []byte {
+	if fv.Type == FieldValueTypeNull {
+		return nil
+	}
+	return fv.str
+}
+
+func (fv *FieldValue) Value() any {
+	switch fv.Type {
+	case FieldValueTypeUnsigned:
+		return fv.AsUint64()
+	case FieldValueTypeSigned:
+		return fv.AsInt64()
+	case FieldValueTypeFloat:
+		return fv.AsFloat64()
+	case FieldValueTypeString:
+		return fv.AsString()
+	default: // FieldValueTypeNull
+		return nil
+	}
+}
+
+// String returns a MySQL literal string that equals the value.
+func (fv *FieldValue) String() string {
+	switch fv.Type {
+	case FieldValueTypeNull:
+		return "NULL"
+	case FieldValueTypeUnsigned:
+		return strconv.FormatUint(fv.AsUint64(), 10)
+	case FieldValueTypeSigned:
+		return strconv.FormatInt(fv.AsInt64(), 10)
+	case FieldValueTypeFloat:
+		return strconv.FormatFloat(fv.AsFloat64(), 'f', -1, 64)
+	case FieldValueTypeString:
+		b := strings.Builder{}
+		b.Grow(len(fv.str) + 2)
+		b.WriteByte('\'')
+		for i := range fv.str {
+			if fv.str[i] == '\'' {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(fv.str[i])
+		}
+		b.WriteByte('\'')
+		return b.String()
+	default:
+		return fmt.Sprintf("unknown type %d of FieldValue", fv.Type)
+	}
 }

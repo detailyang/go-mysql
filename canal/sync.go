@@ -1,41 +1,36 @@
 package canal
 
 import (
-	"fmt"
-	"regexp"
+	"context"
+	"log/slog"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/satori/go.uuid"
-	"github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/replication"
-	"github.com/siddontang/go-mysql/schema"
-	log "github.com/sirupsen/logrus"
-)
-
-var (
-	expAlterTable  = regexp.MustCompile("(?i)^ALTER\\sTABLE\\s.*?`{0,1}(.*?)`{0,1}\\.{0,1}`{0,1}([^`\\.]+?)`{0,1}\\s.*")
-	expRenameTable = regexp.MustCompile("(?i)^RENAME\\sTABLE.*TO\\s.*?`{0,1}(.*?)`{0,1}\\.{0,1}`{0,1}([^`\\.]+?)`{0,1}$")
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/schema"
+	"github.com/go-mysql-org/go-mysql/utils"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 )
 
 func (c *Canal) startSyncer() (*replication.BinlogStreamer, error) {
-	if !c.useGTID {
+	gset := c.master.GTIDSet()
+	if gset == nil || gset.String() == "" {
 		pos := c.master.Position()
 		s, err := c.syncer.StartSync(pos)
 		if err != nil {
 			return nil, errors.Errorf("start sync replication at binlog %v error %v", pos, err)
 		}
-		log.Infof("start sync binlog at binlog file %v", pos)
-		return s, nil
-	} else {
-		gset := c.master.GTID()
-		s, err := c.syncer.StartSyncGTID(gset)
-		if err != nil {
-			return nil, errors.Errorf("start sync replication at GTID %v error %v", gset, err)
-		}
-		log.Infof("start sync binlog at GTID %v", gset)
+		c.cfg.Logger.Info("start sync binlog at binlog file", slog.Any("pos", pos))
 		return s, nil
 	}
+	gsetClone := gset.Clone()
+	s, err := c.syncer.StartSyncGTID(gset)
+	if err != nil {
+		return nil, errors.Errorf("start sync replication at GTID set %v error %v", gset, err)
+	}
+	c.cfg.Logger.Info("start sync binlog at GTID set", slog.Any("gset", gsetClone))
+	return s, nil
 }
 
 func (c *Canal) runSyncBinlog() error {
@@ -44,175 +39,378 @@ func (c *Canal) runSyncBinlog() error {
 		return err
 	}
 
-	savePos := false
-	force := false
 	for {
 		ev, err := s.GetEvent(c.ctx)
-
 		if err != nil {
 			return errors.Trace(err)
 		}
-		savePos = false
-		force = false
-		pos := c.master.Position()
 
-		curPos := pos.Pos
-		//next binlog pos
-		pos.Pos = ev.Header.LogPos
+		// Update the delay between the Canal and the Master before the handler hooks are called
+		c.updateReplicationDelay(ev)
 
-		// We only save position with RotateEvent and XIDEvent.
-		// For RowsEvent, we can't save the position until meeting XIDEvent
-		// which tells the whole transaction is over.
-		// TODO: If we meet any DDL query, we must save too.
 		switch e := ev.Event.(type) {
 		case *replication.RotateEvent:
-			pos.Name = string(e.NextLogName)
-			pos.Pos = uint32(e.Position)
-			log.Infof("rotate binlog to %s", pos)
-			savePos = true
-			force = true
-			if err = c.eventHandler.OnRotate(e); err != nil {
-				return errors.Trace(err)
-			}
-		case *replication.RowsEvent:
-			// we only focus row based event
-			err = c.handleRowsEvent(ev)
-			if err != nil {
-				e := errors.Cause(err)
-				// if error is not ErrExcludedTable or ErrTableNotExist or ErrMissingTableMeta, stop canal
-				if e != ErrExcludedTable &&
-					e != schema.ErrTableNotExist &&
-					e != schema.ErrMissingTableMeta {
-					log.Errorf("handle rows event at (%s, %d) error %v", pos.Name, curPos, err)
-					return errors.Trace(err)
-				}
-			}
-			continue
-		case *replication.XIDEvent:
-			savePos = true
-			// try to save the position later
-			if err := c.eventHandler.OnXID(pos); err != nil {
-				return errors.Trace(err)
-			}
-		case *replication.MariadbGTIDEvent:
-			// try to save the GTID later
-			gtid := &e.GTID
-			c.master.UpdateGTID(gtid)
-			if err := c.eventHandler.OnGTID(gtid); err != nil {
-				return errors.Trace(err)
-			}
-		case *replication.GTIDEvent:
-			u, _ := uuid.FromBytes(e.SID)
-			gset, err := mysql.ParseMysqlGTIDSet(fmt.Sprintf("%s:%d", u.String(), e.GNO))
-			if err != nil {
-				return errors.Trace(err)
-			}
-			c.master.UpdateGTID(gset)
-			if err := c.eventHandler.OnGTID(gset); err != nil {
-				return errors.Trace(err)
-			}
-		case *replication.QueryEvent:
-			if mb := checkRenameTable(e); mb != nil {
-				if len(mb[1]) == 0 {
-					mb[1] = e.Schema
-				}
-				savePos = true
-				force = true
-				c.ClearTableCache(mb[1], mb[2])
-				log.Infof("table structure changed, clear table cache: %s.%s\n", mb[1], mb[2])
-				if err = c.eventHandler.OnDDL(pos, e); err != nil {
-					return errors.Trace(err)
-				}
-			} else {
-				// skip others
-				continue
-			}
+			// If the timestamp equals zero, the received rotate event is a fake rotate event
+			// and contains only the name of the next binlog file. Its log position should be
+			// ignored.
+			// See https://github.com/mysql/mysql-server/blob/8e797a5d6eb3a87f16498edcb7261a75897babae/sql/rpl_binlog_sender.h#L235
+			// and https://github.com/mysql/mysql-server/blob/8cc757da3d87bf4a1f07dcfb2d3c96fed3806870/sql/rpl_binlog_sender.cc#L899
+			if ev.Header.Timestamp == 0 {
+				fakeRotateLogName := string(e.NextLogName)
+				c.cfg.Logger.Info("received fake rotate event", slog.String("nextLogName", string(e.NextLogName)))
 
-		default:
-			continue
+				if fakeRotateLogName != c.master.Position().Name {
+					c.cfg.Logger.Info("log name changed, the fake rotate event will be handled as a real rotate event")
+				} else {
+					continue
+				}
+			}
 		}
 
-		if savePos {
-			c.master.Update(pos)
-			c.eventHandler.OnPosSynced(pos, force)
+		err = c.handleEvent(ev)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
+	savePos := false
+	force := false
+	pos := c.master.Position()
+	var err error
+
+	curPos := pos.Pos
+
+	// next binlog pos
+	pos.Pos = ev.Header.LogPos
+
+	// We only save position with RotateEvent and XIDEvent.
+	// For RowsEvent, we can't save the position until meeting XIDEvent
+	// which tells the whole transaction is over.
+	// TODO: If we meet any DDL query, we must save too.
+	switch e := ev.Event.(type) {
+	case *replication.RotateEvent:
+		pos.Name = string(e.NextLogName)
+		pos.Pos = uint32(e.Position)
+		c.cfg.Logger.Info("rotate binlog", slog.Any("pos", pos))
+		savePos = true
+		force = true
+		if err = c.eventHandler.OnRotate(ev.Header, e); err != nil {
+			return errors.Trace(err)
+		}
+	case *replication.RowsEvent:
+		// we only focus row based event
+		if err := c.handleRowsEvent(ev); err != nil {
+			c.cfg.Logger.Error("handle rows event", slog.String("file", pos.Name), slog.Uint64("position", uint64(curPos)), slog.Any("error", err))
+			return errors.Trace(err)
+		}
+		return nil
+	case *replication.TransactionPayloadEvent:
+		// handle subevent row by row
+		ev := ev.Event.(*replication.TransactionPayloadEvent)
+		for _, subEvent := range ev.Events {
+			err = c.handleEvent(subEvent)
+			if err != nil {
+				c.cfg.Logger.Error("handle transaction payload subevent", slog.String("file", pos.Name), slog.Uint64("position", uint64(curPos)), slog.Any("error", err))
+				return errors.Trace(err)
+			}
+		}
+		return nil
+	case *replication.XIDEvent:
+		savePos = true
+		// try to save the position later
+		if err := c.eventHandler.OnXID(ev.Header, pos); err != nil {
+			return errors.Trace(err)
+		}
+		if e.GSet != nil {
+			c.master.UpdateGTIDSet(e.GSet)
+		}
+	case *replication.MariadbGTIDEvent:
+		if err := c.eventHandler.OnGTID(ev.Header, e); err != nil {
+			return errors.Trace(err)
+		}
+	case *replication.GTIDEvent:
+		if err := c.eventHandler.OnGTID(ev.Header, e); err != nil {
+			return errors.Trace(err)
+		}
+	case *replication.RowsQueryEvent:
+		if err := c.eventHandler.OnRowsQueryEvent(e); err != nil {
+			return errors.Trace(err)
+		}
+	case *replication.MariadbAnnotateRowsEvent:
+		if err := c.eventHandler.OnRowsQueryEvent(&replication.RowsQueryEvent{Query: e.Query}); err != nil {
+			return errors.Trace(err)
+		}
+	case *replication.QueryEvent:
+		stmts, _, err := c.parser.Parse(string(e.Query), "", "")
+		if err != nil {
+			// The parser does not understand all syntax.
+			// For example, it won't parse [CREATE|DROP] TRIGGER statements.
+			c.cfg.Logger.Error("error parsing query, will skip this event", slog.String("query", string(e.Query)), slog.Any("error", err))
+			return nil
+		}
+		for _, stmt := range stmts {
+			switch stmt.(type) {
+			case *ast.BeginStmt, *ast.SavepointStmt:
+				// transaction not yet complete; checkpointing here would skip it on GTID resume
+				continue
+			}
+			savePos = true
+			nodes := parseStmt(stmt)
+			for _, node := range nodes {
+				if node.db == "" {
+					node.db = string(e.Schema)
+				}
+				if err = c.updateTable(ev.Header, node.db, node.table); err != nil {
+					return errors.Trace(err)
+				}
+			}
+			if len(nodes) > 0 {
+				force = true
+				// Now we only handle Table Changed DDL, maybe we will support more later.
+				if err = c.eventHandler.OnDDL(ev.Header, pos, e); err != nil {
+					return errors.Trace(err)
+				}
+			}
+		}
+		if savePos && e.GSet != nil {
+			c.master.UpdateGTIDSet(e.GSet)
+		}
+	default:
+		return nil
+	}
+
+	if savePos {
+		c.master.Update(pos)
+		c.master.UpdateTimestamp(ev.Header.Timestamp)
+
+		if err := c.eventHandler.OnPosSynced(ev.Header, pos, c.master.GTIDSet(), force); err != nil {
+			return errors.Trace(err)
 		}
 	}
 
 	return nil
+}
+
+type node struct {
+	db    string
+	table string
+}
+
+func parseStmt(stmt ast.StmtNode) (ns []*node) {
+	switch t := stmt.(type) {
+	case *ast.RenameTableStmt:
+		ns = make([]*node, len(t.TableToTables))
+		for i, tableInfo := range t.TableToTables {
+			ns[i] = &node{
+				db:    tableInfo.OldTable.Schema.String(),
+				table: tableInfo.OldTable.Name.String(),
+			}
+		}
+	case *ast.AlterTableStmt:
+		n := &node{
+			db:    t.Table.Schema.String(),
+			table: t.Table.Name.String(),
+		}
+		ns = []*node{n}
+	case *ast.DropTableStmt:
+		ns = make([]*node, len(t.Tables))
+		for i, table := range t.Tables {
+			ns[i] = &node{
+				db:    table.Schema.String(),
+				table: table.Name.String(),
+			}
+		}
+	case *ast.CreateTableStmt:
+		n := &node{
+			db:    t.Table.Schema.String(),
+			table: t.Table.Name.String(),
+		}
+		ns = []*node{n}
+	case *ast.TruncateTableStmt:
+		n := &node{
+			db:    t.Table.Schema.String(),
+			table: t.Table.Name.String(),
+		}
+		ns = []*node{n}
+	case *ast.CreateIndexStmt:
+		n := &node{
+			db:    t.Table.Schema.String(),
+			table: t.Table.Name.String(),
+		}
+		ns = []*node{n}
+	case *ast.DropIndexStmt:
+		n := &node{
+			db:    t.Table.Schema.String(),
+			table: t.Table.Name.String(),
+		}
+		ns = []*node{n}
+	}
+	return ns
+}
+
+func (c *Canal) updateTable(header *replication.EventHeader, db, table string) (err error) {
+	c.ClearTableCache([]byte(db), []byte(table))
+	c.cfg.Logger.Info("table structure changed, clear table cache", slog.String("database", db), slog.String("table", table))
+	if err = c.eventHandler.OnTableChanged(header, db, table); err != nil && errors.Cause(err) != schema.ErrTableNotExist {
+		return errors.Trace(err)
+	}
+	return err
+}
+
+func (c *Canal) updateReplicationDelay(ev *replication.BinlogEvent) {
+	var newDelay uint32
+	now := uint32(utils.Now().Unix())
+	if now >= ev.Header.Timestamp {
+		newDelay = now - ev.Header.Timestamp
+	}
+	c.delay.Store(newDelay)
 }
 
 func (c *Canal) handleRowsEvent(e *replication.BinlogEvent) error {
 	ev := e.Event.(*replication.RowsEvent)
 
 	// Caveat: table may be altered at runtime.
-	schema := string(ev.Table.Schema)
-	table := string(ev.Table.Table)
+	schemaName := string(ev.Table.Schema)
+	tableName := string(ev.Table.Table)
 
-	t, err := c.GetTable(schema, table)
+	t, err := c.GetTable(schemaName, tableName)
 	if err != nil {
+		cause := errors.Cause(err)
+		// ignore errors below
+		if cause == ErrExcludedTable || cause == schema.ErrMissingTableMeta {
+			return nil
+		}
+		// Allow handler to decide what to do when table is missing.
+		if cause == schema.ErrTableNotExist {
+			return c.eventHandler.OnTableNotFound(e.Header, ev)
+		}
 		return err
 	}
 	var action string
 	switch e.Header.EventType {
-	case replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
+	case replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2, replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
 		action = InsertAction
-	case replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
+	case replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2, replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
 		action = DeleteAction
-	case replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2:
+	case replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2, replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
 		action = UpdateAction
 	default:
 		return errors.Errorf("%s not supported now", e.Header.EventType)
 	}
-	events := newRowsEvent(t, action, ev.Rows)
+	events := newRowsEvent(t, action, ev.Rows, e.Header, ev)
 	return c.eventHandler.OnRow(events)
 }
 
+func (c *Canal) FlushBinlog() error {
+	_, err := c.Execute("FLUSH BINARY LOGS")
+	return errors.Trace(err)
+}
+
 func (c *Canal) WaitUntilPos(pos mysql.Position, timeout time.Duration) error {
+	return c.WaitUntilPosContext(context.Background(), pos, timeout)
+}
+
+func (c *Canal) WaitUntilPosContext(ctx context.Context, pos mysql.Position, timeout time.Duration) error {
 	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-timer.C:
 			return errors.Errorf("wait position %v too long > %s", pos, timeout)
 		default:
+			if !c.cfg.DisableFlushBinlogWhileWaiting {
+				err := c.FlushBinlog()
+				if err != nil {
+					return errors.Trace(err)
+				}
+			}
 			curPos := c.master.Position()
 			if curPos.Compare(pos) >= 0 {
 				return nil
 			} else {
-				log.Debugf("master pos is %v, wait catching %v", curPos, pos)
+				c.cfg.Logger.Debug("master pos is behind, wait to catch up", slog.String("master file", curPos.Name), slog.Uint64("master position", uint64(curPos.Pos)),
+					slog.String("target file", pos.Name), slog.Uint64("target position", uint64(curPos.Pos)))
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}
+}
 
-	return nil
+// getShowBinaryLogQuery returns the correct SQL statement to query binlog status
+// for the given database flavor and server version.
+//
+// Sources:
+//
+//	MySQL:   https://dev.mysql.com/doc/relnotes/mysql/8.4/en/news-8-4-0.html
+//	MariaDB: https://mariadb.com/kb/en/show-binlog-status
+func getShowBinaryLogQuery(flavor, serverVersion string) string {
+	switch flavor {
+	case mysql.MariaDBFlavor:
+		eq, err := mysql.CompareServerVersions(serverVersion, "10.5.2")
+		if (err == nil) && (eq >= 0) {
+			return "SHOW BINLOG STATUS"
+		}
+	case mysql.MySQLFlavor:
+		eq, err := mysql.CompareServerVersions(serverVersion, "8.4.0")
+		if (err == nil) && (eq >= 0) {
+			return "SHOW BINARY LOG STATUS"
+		}
+	}
+
+	return "SHOW MASTER STATUS"
 }
 
 func (c *Canal) GetMasterPos() (mysql.Position, error) {
-	rr, err := c.Execute("SHOW MASTER STATUS")
+	query := getShowBinaryLogQuery(c.cfg.Flavor, c.conn.GetServerVersion())
+
+	rr, err := c.Execute(query)
 	if err != nil {
-		return mysql.Position{"", 0}, errors.Trace(err)
+		return mysql.Position{}, errors.Trace(err)
 	}
 
 	name, _ := rr.GetString(0, 0)
 	pos, _ := rr.GetInt(0, 1)
 
-	return mysql.Position{name, uint32(pos)}, nil
+	return mysql.Position{Name: name, Pos: uint32(pos)}, nil
+}
+
+func (c *Canal) GetMasterGTIDSet() (mysql.GTIDSet, error) {
+	query := ""
+	switch c.cfg.Flavor {
+	case mysql.MariaDBFlavor:
+		query = "SELECT @@GLOBAL.gtid_current_pos"
+	default:
+		query = "SELECT @@GLOBAL.GTID_EXECUTED"
+	}
+	rr, err := c.Execute(query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	gx, err := rr.GetString(0, 0)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	gset, err := mysql.ParseGTIDSet(c.cfg.Flavor, gx)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return gset, nil
 }
 
 func (c *Canal) CatchMasterPos(timeout time.Duration) error {
+	return c.CatchMasterPosContext(context.Background(), timeout)
+}
+
+func (c *Canal) CatchMasterPosContext(ctx context.Context, timeout time.Duration) error {
 	pos, err := c.GetMasterPos()
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	return c.WaitUntilPos(pos, timeout)
-}
-
-func checkRenameTable(e *replication.QueryEvent) [][]byte {
-	var mb = [][]byte{}
-	if mb = expAlterTable.FindSubmatch(e.Query); mb != nil {
-		return mb
-	}
-	mb = expRenameTable.FindSubmatch(e.Query)
-	return mb
+	return c.WaitUntilPosContext(ctx, pos, timeout)
 }

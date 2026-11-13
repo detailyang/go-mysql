@@ -1,119 +1,172 @@
 package server
 
 import (
-	"bytes"
-	"encoding/binary"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"fmt"
 
-	. "github.com/siddontang/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/pingcap/errors"
 )
 
-func (c *Conn) writeInitialHandshake() error {
-	capability := CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG |
-		CLIENT_CONNECT_WITH_DB | CLIENT_PROTOCOL_41 |
-		CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION
+var (
+	ErrAccessDenied           = errors.New("access denied")
+	ErrAccessDeniedNoPassword = fmt.Errorf("%w without password", ErrAccessDenied)
+)
 
-	data := make([]byte, 4, 128)
-
-	//min version 10
-	data = append(data, 10)
-
-	//server version[00]
-	data = append(data, ServerVersion...)
-	data = append(data, 0)
-
-	//connection id
-	data = append(data, byte(c.connectionID), byte(c.connectionID>>8), byte(c.connectionID>>16), byte(c.connectionID>>24))
-
-	//auth-plugin-data-part-1
-	data = append(data, c.salt[0:8]...)
-
-	//filter [00]
-	data = append(data, 0)
-
-	//capability flag lower 2 bytes, using default capability here
-	data = append(data, byte(capability), byte(capability>>8))
-
-	//charset, utf-8 default
-	data = append(data, uint8(DEFAULT_COLLATION_ID))
-
-	//status
-	data = append(data, byte(c.status), byte(c.status>>8))
-
-	//below 13 byte may not be used
-	//capability flag upper 2 bytes, using default capability here
-	data = append(data, byte(capability>>16), byte(capability>>24))
-
-	//filter [0x15], for wireshark dump, value is 0x15
-	data = append(data, 0x15)
-
-	//reserved 10 [00]
-	data = append(data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-
-	//auth-plugin-data-part-2
-	data = append(data, c.salt[8:]...)
-
-	//filter [00]
-	data = append(data, 0)
-
-	return c.WritePacket(data)
+// isEmptyPassword returns true if the auth data represents an empty password.
+// Some clients send an empty packet (len == 0), while others (e.g. MySQL's libmysql)
+// send a single null byte. This matches MySQL server's own handling:
+// if (!pkt_len || (pkt_len == 1 && *pkt == 0))
+// https://github.com/mysql/mysql-server/blob/8.0/sql/auth/sha2_password.cc
+// https://github.com/mysql/mysql-server/blob/8.0/sql/auth/sql_authentication.cc
+func isEmptyPassword(authData []byte) bool {
+	return len(authData) == 0 || (len(authData) == 1 && authData[0] == 0)
 }
 
-func (c *Conn) readHandshakeResponse(password string) error {
-	data, err := c.ReadPacket()
+func (c *Conn) compareAuthData(authPluginName string, clientAuthData []byte) error {
+	if authPluginName != c.credential.AuthPluginName {
+		err := c.writeAuthSwitchRequest(c.credential.AuthPluginName)
+		if err != nil {
+			return err
+		}
+		return c.handleAuthSwitchResponse()
+	}
 
+	return c.serverConf.authProvider.Authenticate(c, authPluginName, clientAuthData)
+}
+
+func (c *Conn) acquireCredential() error {
+	if len(c.credential.Passwords) > 0 {
+		return nil
+	}
+	credential, found, err := c.authHandler.GetCredential(c.user)
 	if err != nil {
 		return err
 	}
-
-	pos := 0
-
-	//capability
-	c.capability = binary.LittleEndian.Uint32(data[:4])
-	pos += 4
-
-	//skip max packet size
-	pos += 4
-
-	//charset, skip, if you want to use another charset, use set names
-	//c.collation = CollationId(data[pos])
-	pos++
-
-	//skip reserved 23[00]
-	pos += 23
-
-	//user name
-	user := string(data[pos : pos+bytes.IndexByte(data[pos:], 0)])
-	pos += len(user) + 1
-
-	if c.user != user {
-		return NewDefaultError(ER_NO_SUCH_USER, user, c.RemoteAddr().String())
+	if !found || len(credential.Passwords) == 0 {
+		return mysql.NewDefaultError(mysql.ER_NO_SUCH_USER, c.user, c.RemoteAddr().String())
 	}
+	c.credential = credential
+	return nil
+}
 
-	//auth length and auth
-	authLen := int(data[pos])
-	pos++
-	auth := data[pos : pos+authLen]
-
-	checkAuth := CalcPassword(c.salt, []byte(password))
-
-	if !bytes.Equal(auth, checkAuth) {
-		return NewDefaultError(ER_ACCESS_DENIED_ERROR, c.RemoteAddr().String(), c.user, "Yes")
+func scrambleValidation(cached, nonce, scramble []byte) bool {
+	// SHA256(SHA256(SHA256(STORED_PASSWORD)), NONCE)
+	crypt := sha256.New()
+	crypt.Write(cached)
+	crypt.Write(nonce)
+	message2 := crypt.Sum(nil)
+	// SHA256(PASSWORD)
+	if len(message2) != len(scramble) {
+		return false
 	}
+	for i := range message2 {
+		message2[i] ^= scramble[i]
+	}
+	// SHA256(SHA256(PASSWORD)
+	crypt.Reset()
+	crypt.Write(message2)
+	m := crypt.Sum(nil)
+	return subtle.ConstantTimeCompare(m, cached) == 1
+}
 
-	pos += authLen
-
-	if c.capability|CLIENT_CONNECT_WITH_DB > 0 {
-		if len(data[pos:]) == 0 {
+func (c *Conn) compareNativePasswordAuthData(clientAuthData []byte, credential Credential) error {
+	if isEmptyPassword(clientAuthData) {
+		if credential.hasEmptyPassword() {
 			return nil
 		}
-
-		db := string(data[pos : pos+bytes.IndexByte(data[pos:], 0)])
-		pos += len(db) + 1
-
-		if err = c.h.UseDB(db); err != nil {
-			return err
-		}
+		return ErrAccessDeniedNoPassword
 	}
 
+	for _, password := range credential.Passwords {
+		hash, err := credential.hashPassword(password)
+		if err != nil || hash == "" {
+			continue
+		}
+		decoded, err := mysql.DecodePasswordHex(hash)
+		if err != nil {
+			continue
+		}
+		if mysql.CompareNativePassword(clientAuthData, decoded, c.salt) {
+			return nil
+		}
+	}
+	return ErrAccessDenied
+}
+
+func (c *Conn) compareSha256PasswordAuthData(clientAuthData []byte, credential Credential) error {
+	if isEmptyPassword(clientAuthData) {
+		if credential.hasEmptyPassword() {
+			return nil
+		}
+		return ErrAccessDeniedNoPassword
+	}
+	if tlsConn, ok := c.Conn.Conn.(*tls.Conn); ok {
+		if !tlsConn.ConnectionState().HandshakeComplete {
+			return errors.New("incomplete TSL handshake")
+		}
+		// connection is SSL/TLS, client should send plain password
+		// deal with the trailing \NUL added for plain text password received
+		if l := len(clientAuthData); l != 0 && clientAuthData[l-1] == 0x00 {
+			clientAuthData = clientAuthData[:l-1]
+		}
+	} else {
+		// client should send encrypted password
+		// decrypt
+		if c.serverConf.rsaPrivateKey == nil {
+			return errors.New("RSA key not configured; non-TLS connections are not supported for this authentication method")
+		}
+		dbytes, err := rsa.DecryptOAEP(sha1.New(), rand.Reader, c.serverConf.rsaPrivateKey, clientAuthData, nil)
+		if err != nil {
+			return err
+		}
+		clientAuthData = mysql.Xor(dbytes, c.salt)
+		if l := len(clientAuthData); l != 0 && clientAuthData[l-1] == 0x00 {
+			clientAuthData = clientAuthData[:l-1]
+		}
+	}
+	for _, password := range credential.Passwords {
+		hash, err := credential.hashPassword(password)
+		if err != nil {
+			continue
+		}
+		check, err := mysql.Check256HashingPassword([]byte(hash), string(clientAuthData))
+		if err != nil {
+			continue
+		}
+		if check {
+			return nil
+		}
+	}
+	return ErrAccessDenied
+}
+
+func (c *Conn) compareCacheSha2PasswordAuthData(clientAuthData []byte) error {
+	if isEmptyPassword(clientAuthData) {
+		if c.credential.hasEmptyPassword() {
+			return nil
+		}
+		return ErrAccessDeniedNoPassword
+	}
+	// the caching of 'caching_sha2_password' in MySQL, see: https://dev.mysql.com/worklog/task/?id=9591
+	// check if we have a cached value
+	cached, ok := c.serverConf.cacheShaPassword.Load(fmt.Sprintf("%s@%s", c.user, c.LocalAddr()))
+	if ok {
+		// Scramble validation
+		if scrambleValidation(cached.([]byte), c.salt, clientAuthData) {
+			// 'fast' auth: write "More data" packet (first byte == 0x01) with the second byte = 0x03
+			return c.writeAuthMoreDataFastAuth()
+		}
+	}
+	// cache miss or validation failed, do full auth
+	if err := c.writeAuthMoreDataFullAuth(); err != nil {
+		return err
+	}
+	c.cachingSha2FullAuth = true
 	return nil
 }

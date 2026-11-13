@@ -3,7 +3,7 @@ package mysql
 import (
 	"fmt"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 )
 
 var (
@@ -23,8 +23,8 @@ func (e *MyError) Error() string {
 	return fmt.Sprintf("ERROR %d (%s): %s", e.Code, e.State, e.Message)
 }
 
-//default mysql error, must adapt errname message format
-func NewDefaultError(errCode uint16, args ...interface{}) *MyError {
+// NewDefaultError: default mysql error, must adapt errname message format
+func NewDefaultError(errCode uint16, args ...any) *MyError {
 	e := new(MyError)
 	e.Code = errCode
 
@@ -61,6 +61,6 @@ func NewError(errCode uint16, message string) *MyError {
 func ErrorCode(errMsg string) (code int) {
 	var tmpStr string
 	// golang scanf doesn't support %*,so I used a temporary variable
-	fmt.Sscanf(errMsg, "%s%d", &tmpStr, &code)
-	return
+	_, _ = fmt.Sscanf(errMsg, "%s%d", &tmpStr, &code)
+	return code
 }

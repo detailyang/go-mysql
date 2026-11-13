@@ -1,0 +1,435 @@
+package replication
+
+import (
+	"runtime"
+	"testing"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/stretchr/testify/require"
+)
+
+// newTestTransactionPayloadEvent returns a TransactionPayloadEvent carrying
+// a real ZSTD-compressed payload. The payload holds one transaction: BEGIN,
+// three table maps with write/update/delete rows events and COMMIT. The
+// event is not attached to a parser; tests copy its format onto a parser
+// and produce events through newTransactionPayloadEvent.
+func newTestTransactionPayloadEvent() *TransactionPayloadEvent {
+	return &TransactionPayloadEvent{
+		format: FormatDescriptionEvent{
+			Version:                0x4,
+			ServerVersion:          "8.0.27",
+			CreateTimestamp:        0x0,
+			EventHeaderLength:      0x13,
+			EventTypeHeaderLengths: []uint8{0x38, 0xd, 0x0, 0x8, 0x0, 0x12, 0x0, 0x4, 0x4, 0x4, 0x4, 0x12, 0x0, 0x0, 0x5c, 0x0, 0x4, 0x1a, 0x8, 0x0, 0x0, 0x0, 0x8, 0x8, 0x8, 0x2, 0x0, 0x0, 0x0, 0xa, 0xa, 0xa, 0x19, 0x19, 0x0, 0x12, 0x34, 0x0, 0xa, 0x28, 0x0},
+			ChecksumAlgorithm:      0x1,
+		},
+		Size:             91132,
+		UncompressedSize: 625404,
+		CompressionType:  ZSTD,
+		Payload: []byte{
+			0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x58, 0xbc, 0x0a,
+			0x00, 0xf6, 0x13, 0x44, 0x35, 0x60, 0x45, 0xd3,
+			0x1c, 0x00, 0x92, 0x80, 0xa2, 0x43, 0x5d, 0x92,
+			0xe0, 0x70, 0x43, 0xc5, 0x30, 0x0c, 0x12, 0x9c,
+			0xdf, 0xcd, 0xfa, 0x0d, 0x1a, 0x06, 0x11, 0x11,
+			0x91, 0x05, 0x79, 0x83, 0x3e, 0x4a, 0x41, 0xda,
+			0xbb, 0xb5, 0x6e, 0xd4, 0xb7, 0xb0, 0x36, 0x45,
+			0x98, 0x23, 0x74, 0x0d, 0x6b, 0x3c, 0xfa, 0xde,
+			0x24, 0x05, 0x37, 0x00, 0x34, 0x00, 0x36, 0x00,
+			0xec, 0x97, 0x4b, 0xfe, 0x33, 0x04, 0x9c, 0x27,
+			0xeb, 0x41, 0xe2, 0x10, 0x69, 0x78, 0x45, 0xd9,
+			0x6a, 0x52, 0x41, 0x91, 0xa0, 0x28, 0x6b, 0xa9,
+			0x50, 0x50, 0xe8, 0xaf, 0x83, 0x5f, 0x87, 0x1c,
+			0xc2, 0xa8, 0x15, 0xd5, 0x34, 0xfe, 0x3f, 0x72,
+			0xf1, 0x07, 0xbb, 0xc2, 0xef, 0x78, 0xc1, 0x07,
+			0x0e, 0xf1, 0x9f, 0x35, 0x9c, 0x27, 0x2b, 0x52,
+			0x8c, 0xf4, 0x49, 0x67, 0xfb, 0x3e, 0x7a, 0x2d,
+			0xec, 0x5a, 0xa5, 0x8d, 0xd6, 0x81, 0x53, 0xfe,
+			0xcd, 0xe2, 0x7f, 0xfb, 0xd5, 0xbc, 0x35, 0x00,
+			0xff, 0xd9, 0x02, 0xce, 0x93, 0xf5, 0x2b, 0xd3,
+			0xb4, 0x33, 0xd6, 0x38, 0xa3, 0x19, 0x64, 0x9a,
+			0xe6, 0x5d, 0x75, 0x9d, 0x58, 0x6c, 0xe9, 0x09,
+			0x02, 0xc7, 0x03, 0xf3, 0x3a, 0xcf, 0x85, 0x11,
+			0x52, 0x2a, 0x25, 0x7c, 0xd1, 0x75, 0x8d, 0xae,
+			0x75, 0x9c, 0x87, 0xc6, 0x87, 0xfd, 0x0a, 0x98,
+			0x0c, 0x38, 0x4f, 0x18, 0x8c, 0x35, 0x65, 0x6c,
+			0x9b, 0xde, 0xe7, 0x1e, 0x28, 0x59, 0xe9, 0x38,
+			0x77, 0xba, 0x48, 0x8a, 0xb1, 0x3e, 0x91, 0x8d,
+			0xe4, 0x8c, 0xee, 0xeb, 0x5a, 0x6f, 0xf7, 0x75,
+			0x01, 0xff, 0xff, 0x3f, 0x22, 0xe1, 0x3f, 0x73,
+			0xe0, 0x6c, 0x61, 0x87, 0x0f, 0x9c, 0xa7, 0xeb,
+			0xb2, 0xaa, 0xad, 0xba, 0x56, 0x2e, 0xff, 0x05,
+			0x02, 0x4c, 0x19, 0x53, 0xe8, 0x76, 0xcf, 0xea,
+			0xae, 0xe4, 0x40, 0x55, 0x82, 0x8f, 0x46, 0x11,
+			0x84, 0xde, 0x9c, 0x33, 0x42, 0xea, 0x60, 0x43,
+			0xd2, 0x94, 0x8f, 0x0c, 0x18, 0x00, 0x56, 0x15,
+			0x08, 0x52, 0xd0, 0x00, 0x10, 0x06, 0xac, 0x2e,
+			0xd7, 0x32, 0x8a, 0xa4, 0x84, 0x0c, 0x48, 0x42,
+			0x80, 0x44, 0x9a, 0xe5, 0x02, 0x37, 0x9b, 0x87,
+			0x24, 0x02, 0x01, 0x3d, 0x86, 0x50, 0x4d, 0x3e,
+			0x91, 0x39, 0x40, 0x0d, 0xb0, 0xaf, 0xf0, 0x09,
+			0xfa, 0x9a, 0x1e, 0x43, 0xd4, 0x60, 0x82, 0x84,
+			0x37, 0x81, 0x78, 0x55, 0xcd, 0x00, 0x0c, 0x27,
+			0x78, 0x10, 0x08, 0x0d, 0x06, 0x19, 0x80, 0x17,
+			0x01, 0x00, 0x00,
+		},
+	}
+}
+
+// TestBinlogParserCloneForPayloadDecode verifies that the inner parser
+// used for decompressed transaction payloads inherits user-settable
+// decode options from its parent. Without this, JSON columns in
+// compressed transactions would silently fall back to legacy rendering
+// even when RenderJSONAsMySQLText (and friends) are configured on the
+// outer parser.
+func TestBinlogParserCloneForPayloadDecode(t *testing.T) {
+	loc, err := time.LoadLocation("UTC")
+	require.NoError(t, err)
+
+	outer := NewBinlogParser()
+	outer.SetFlavor("mariadb")
+	outer.SetRawMode(true)
+	outer.SetParseTime(true)
+	outer.SetTimestampStringLocation(loc)
+	outer.SetUseDecimal(true)
+	outer.SetUseFloatWithTrailingZero(true)
+	outer.SetRenderJSONAsMySQLText(true)
+	outer.SetIgnoreJSONDecodeError(true)
+	outer.SetVerifyChecksum(true) // intentionally not propagated
+	outer.SetPayloadDecoderConcurrency(7)
+
+	inner := outer.cloneForPayloadDecode()
+
+	require.Equal(t, "mariadb", inner.flavor)
+	require.True(t, inner.rawMode)
+	require.True(t, inner.parseTime)
+	require.Same(t, loc, inner.timestampStringLocation)
+	require.True(t, inner.useDecimal)
+	require.True(t, inner.useFloatWithTrailingZero)
+	require.True(t, inner.renderJSONAsMySQLText)
+	require.True(t, inner.ignoreJSONDecodeErr)
+	require.Equal(t, 7, inner.payloadDecoderConcurrency)
+	// Checksum verification must be off: nested events do not carry
+	// their own checksum trailers.
+	require.False(t, inner.verifyChecksum)
+	// tables must be a fresh map, not shared with the outer parser.
+	require.NotNil(t, inner.tables)
+	require.NotSame(t, &outer.tables, &inner.tables)
+	// clones never decode transaction payloads, so they carry no
+	// decoder pool
+	require.Nil(t, inner.decoderPool)
+}
+
+// TestNewTransactionPayloadEventInheritsParent verifies that events
+// created via the parser path carry a reference to it, so that
+// decodePayload picks up the parser options.
+func TestNewTransactionPayloadEventInheritsParent(t *testing.T) {
+	p := NewBinlogParser()
+	p.format = &FormatDescriptionEvent{} // newTransactionPayloadEvent dereferences this
+	p.SetRenderJSONAsMySQLText(true)
+
+	e := p.newTransactionPayloadEvent()
+	require.Same(t, p, e.parent)
+}
+
+func TestTransactionPayloadEventDecode(t *testing.T) {
+	p := NewBinlogParser()
+	p.SetPayloadDecoderConcurrency(2)
+
+	src := newTestTransactionPayloadEvent()
+	p.format = &src.format
+
+	newEvent := func() *TransactionPayloadEvent {
+		e := p.newTransactionPayloadEvent()
+		e.Size = src.Size
+		e.UncompressedSize = src.UncompressedSize
+		e.CompressionType = src.CompressionType
+		e.Payload = src.Payload
+
+		return e
+	}
+
+	e := newEvent()
+	err := e.decodePayload()
+	require.NoError(t, err)
+
+	// Check raw events
+	require.Len(t, e.Events, 8)
+	require.Equal(t, QUERY_EVENT, e.Events[0].Header.EventType)
+	require.Equal(t, TABLE_MAP_EVENT, e.Events[1].Header.EventType)
+	require.Equal(t, WRITE_ROWS_EVENTv2, e.Events[2].Header.EventType)
+	require.Equal(t, TABLE_MAP_EVENT, e.Events[3].Header.EventType)
+	require.Equal(t, UPDATE_ROWS_EVENTv2, e.Events[4].Header.EventType)
+	require.Equal(t, TABLE_MAP_EVENT, e.Events[5].Header.EventType)
+	require.Equal(t, DELETE_ROWS_EVENTv2, e.Events[6].Header.EventType)
+	require.Equal(t, XID_EVENT, e.Events[7].Header.EventType)
+
+	// Check insert/update/delete rows events casting
+	ievent, ok := e.Events[2].Event.(*RowsEvent)
+	require.True(t, ok)
+	require.Equal(t, ievent.Type(), EnumRowsEventTypeInsert)
+
+	uevent, ok := e.Events[4].Event.(*RowsEvent)
+	require.True(t, ok)
+	require.Equal(t, uevent.Type(), EnumRowsEventTypeUpdate)
+
+	devent, ok := e.Events[6].Event.(*RowsEvent)
+	require.True(t, ok)
+	require.Equal(t, devent.Type(), EnumRowsEventTypeDelete)
+
+	// MySQL writes inner events with LogPos=0 (copied from transaction cache
+	// before position fixup); parser must stamp usable positions, see
+	// stampInnerEventPositions
+	for _, inner := range e.Events {
+		require.Equal(t, uint32(0), inner.Header.LogPos)
+	}
+
+	// decodePayload hands the decoder back to the cache; a following
+	// getPayloadDecoder takes the cache-hit path and the next event decodes
+	// correctly from it. The capacity-1 channel is deterministic, so the
+	// very same decoder comes back.
+	decoder, err := p.getPayloadDecoder()
+	require.NoError(t, err)
+	require.NotNil(t, decoder)
+	p.putPayloadDecoder(decoder)
+
+	cached, err := p.getPayloadDecoder()
+	require.NoError(t, err)
+	require.Same(t, decoder, cached)
+	p.putPayloadDecoder(cached)
+
+	e = newEvent()
+	require.NoError(t, e.decodePayload())
+	require.Len(t, e.Events, 8)
+}
+
+func TestTransactionPayloadEventDecodeInvalidPayload(t *testing.T) {
+	p := NewBinlogParser()
+	p.SetPayloadDecoderConcurrency(1)
+	p.format = &FormatDescriptionEvent{}
+
+	e := p.newTransactionPayloadEvent()
+	e.CompressionType = ZSTD
+	e.Payload = []byte("not a zstd frame")
+	require.Error(t, e.decodePayload())
+}
+
+// TestPayloadDecoderPoolInvalidConcurrency verifies the explicit decoder
+// creation path: a negative concurrency is normalized to zstd's default
+// and the returned decoder is usable. Before the get-function redesign,
+// the pool's New discarded the zstd.NewReader error and stored nil,
+// panicking on the first DecodeAll.
+func TestPayloadDecoderPoolInvalidConcurrency(t *testing.T) {
+	p := NewBinlogParser()
+	p.SetPayloadDecoderConcurrency(-1)
+
+	decoder, err := p.getPayloadDecoder()
+	require.NoError(t, err)
+	require.NotNil(t, decoder)
+
+	_, err = decoder.DecodeAll(newTestTransactionPayloadEvent().Payload, nil)
+	require.NoError(t, err)
+}
+
+// TestPayloadDecoderParserClose verifies the eviction path: Close closes
+// the cached decoder and clears the slot, and the parser stays usable —
+// the next getPayloadDecoder lazily builds a fresh, working decoder.
+func TestPayloadDecoderParserClose(t *testing.T) {
+	p := NewBinlogParser()
+
+	decoder, err := p.getPayloadDecoder()
+	require.NoError(t, err)
+	p.putPayloadDecoder(decoder)
+
+	p.Close()
+
+	// the evicted decoder must have been closed
+	_, err = decoder.DecodeAll(newTestTransactionPayloadEvent().Payload, nil)
+	require.ErrorIs(t, err, zstd.ErrDecoderClosed)
+
+	// Close is idempotent
+	p.Close()
+
+	// the next get lazily rebuilds
+	fresh, err := p.getPayloadDecoder()
+	require.NoError(t, err)
+	require.NotNil(t, fresh)
+	_, err = fresh.DecodeAll(newTestTransactionPayloadEvent().Payload, nil)
+	require.NoError(t, err)
+	p.putPayloadDecoder(fresh)
+
+	// put on a full cache closes the dropped decoder
+	a, err := p.getPayloadDecoder() // takes fresh out of the cache
+	require.NoError(t, err)
+	b, err := p.getPayloadDecoder() // cache empty, builds a second decoder
+	require.NoError(t, err)
+	p.putPayloadDecoder(a) // cached
+	p.putPayloadDecoder(b) // full: closed and dropped
+	_, err = b.DecodeAll(newTestTransactionPayloadEvent().Payload, nil)
+	require.ErrorIs(t, err, zstd.ErrDecoderClosed)
+}
+
+// TestPayloadDecoderNoBackgroundGoroutine pins the invariant that makes
+// caching a decoder without closing it per decode safe: decoders are
+// created with a nil reader and driven only through DecodeAll, so zstd
+// never starts its streaming decoder goroutine. If a future change ever
+// routes a pooled decoder through Reset/Read, this test fails instead of
+// leaking goroutines silently.
+func TestPayloadDecoderNoBackgroundGoroutine(t *testing.T) {
+	src := newTestTransactionPayloadEvent()
+	p := NewBinlogParser()
+	p.format = &src.format
+
+	newEvent := func() *TransactionPayloadEvent {
+		e := p.newTransactionPayloadEvent()
+		e.Size = src.Size
+		e.UncompressedSize = src.UncompressedSize
+		e.CompressionType = src.CompressionType
+		e.Payload = src.Payload
+
+		return e
+	}
+
+	goroutinesBefore := runtime.NumGoroutine()
+	for range 10 {
+		require.NoError(t, newEvent().decodePayload())
+	}
+
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	require.NotContains(t, string(buf[:n]), "startStreamDecoder",
+		"zstd streaming decoder goroutine detected; cached decoders are no longer goroutine-free")
+
+	runtime.GC()
+	// Poll from the test goroutine: require.Eventually runs its condition
+	// on an extra goroutine that would skew the count it measures.
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > goroutinesBefore {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine count grew from %d to %d after decoding payload events",
+				goroutinesBefore, runtime.NumGoroutine())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestTransactionPayloadEventDecodeNegativeConcurrency exercises the
+// real path: decodePayload creates the parser's pool lazily with the
+// user-provided concurrency, so it must survive a negative value too.
+func TestTransactionPayloadEventDecodeNegativeConcurrency(t *testing.T) {
+	p := NewBinlogParser()
+	p.SetPayloadDecoderConcurrency(-1)
+
+	src := newTestTransactionPayloadEvent()
+	p.format = &src.format
+
+	e := p.newTransactionPayloadEvent()
+	e.Size = src.Size
+	e.UncompressedSize = src.UncompressedSize
+	e.CompressionType = src.CompressionType
+	e.Payload = src.Payload
+
+	require.NoError(t, e.decodePayload())
+	require.Len(t, e.Events, 8)
+}
+
+func TestTransactionPayloadEventStampInnerEventPositions(t *testing.T) {
+	mk := func(types ...EventType) *TransactionPayloadEvent {
+		e := &TransactionPayloadEvent{}
+		for _, typ := range types {
+			e.Events = append(e.Events, &BinlogEvent{Header: &EventHeader{EventType: typ}})
+		}
+		return e
+	}
+
+	e := mk(QUERY_EVENT, TABLE_MAP_EVENT, WRITE_ROWS_EVENTv2, XID_EVENT)
+	e.stampInnerEventPositions(&EventHeader{LogPos: 5000, EventSize: 1200})
+	// mid-transaction events point at payload start so resume replays
+	// whole transaction
+	for _, inner := range e.Events[:3] {
+		require.Equal(t, uint32(3800), inner.Header.LogPos)
+	}
+	// final event (XID) points past payload so resume skips transaction
+	require.Equal(t, uint32(5000), e.Events[3].Header.LogPos)
+
+	// outer LogPos=0 (eg artificial event), leave inner events untouched
+	e = mk(QUERY_EVENT, XID_EVENT)
+	e.stampInnerEventPositions(&EventHeader{LogPos: 0, EventSize: 1200})
+	for _, inner := range e.Events {
+		require.Equal(t, uint32(0), inner.Header.LogPos)
+	}
+
+	// no events, must not panic
+	mk().stampInnerEventPositions(&EventHeader{LogPos: 5000, EventSize: 1200})
+}
+
+// BenchmarkTransactionPayloadEventDecode measures decoding a compressed
+// transaction payload through the parser's pooled decoder.
+func BenchmarkTransactionPayloadEventDecode(b *testing.B) {
+	src := newTestTransactionPayloadEvent()
+	p := NewBinlogParser()
+	p.SetPayloadDecoderConcurrency(2)
+	p.format = &src.format
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e := p.newTransactionPayloadEvent()
+		e.Size = src.Size
+		e.UncompressedSize = src.UncompressedSize
+		e.CompressionType = src.CompressionType
+		e.Payload = src.Payload
+
+		if err := e.decodePayload(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The pair below isolates the decoder lifecycle change in decodePayload:
+// the split/parse of inner events is shared by both sides, so the delta
+// is the cost of a fresh zstd decoder per event versus a pooled one.
+// Concurrency 0 applies zstd's default (GOMAXPROCS), matching parsers
+// that never call SetPayloadDecoderConcurrency.
+
+// BenchmarkPayloadDecoderPerCall measures the decodePayload behavior
+// before the pooling change: a fresh zstd decoder is built and closed
+// for every event.
+func BenchmarkPayloadDecoderPerCall(b *testing.B) {
+	payload := newTestTransactionPayloadEvent().Payload
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := decoder.DecodeAll(payload, nil); err != nil {
+			b.Fatal(err)
+		}
+		decoder.Close()
+	}
+}
+
+// BenchmarkPayloadDecoderPooled measures the decodePayload behavior
+// after the pooling change: decoders come from the parser's pool via
+// getPayloadDecoder and are returned after use.
+func BenchmarkPayloadDecoderPooled(b *testing.B) {
+	payload := newTestTransactionPayloadEvent().Payload
+	p := &BinlogParser{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		decoder, err := p.getPayloadDecoder()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := decoder.DecodeAll(payload, nil); err != nil {
+			b.Fatal(err)
+		}
+		p.putPayloadDecoder(decoder)
+	}
+}

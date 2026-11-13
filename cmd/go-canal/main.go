@@ -3,45 +3,59 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/siddontang/go-mysql/canal"
-	"github.com/siddontang/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/pingcap/errors"
 )
 
-var host = flag.String("host", "127.0.0.1", "MySQL host")
-var port = flag.Int("port", 3306, "MySQL port")
-var user = flag.String("user", "root", "MySQL user, must have replication privilege")
-var password = flag.String("password", "", "MySQL password")
+var (
+	host     = flag.String("host", "127.0.0.1", "MySQL host")
+	port     = flag.Int("port", 3306, "MySQL port")
+	user     = flag.String("user", "root", "MySQL user, must have replication privilege")
+	password = flag.String("password", "", "MySQL password")
 
-var flavor = flag.String("flavor", "mysql", "Flavor: mysql or mariadb")
+	flavor = flag.String("flavor", "mysql", "Flavor: mysql or mariadb")
 
-var serverID = flag.Int("server-id", 101, "Unique Server ID")
-var mysqldump = flag.String("mysqldump", "mysqldump", "mysqldump execution path")
+	serverID  = flag.Int("server-id", 101, "Unique Server ID")
+	mysqldump = flag.String("mysqldump", "mysqldump", "mysqldump execution path")
 
-var dbs = flag.String("dbs", "test", "dump databases, seperated by comma")
-var tables = flag.String("tables", "", "dump tables, seperated by comma, will overwrite dbs")
-var tableDB = flag.String("table_db", "test", "database for dump tables")
-var ignoreTables = flag.String("ignore_tables", "", "ignore tables, must be database.table format, separated by comma")
+	dbs          = flag.String("dbs", "test", "dump databases, separated by comma")
+	tables       = flag.String("tables", "", "dump tables, separated by comma, will overwrite dbs")
+	tableDB      = flag.String("table_db", "test", "database for dump tables")
+	ignoreTables = flag.String("ignore_tables", "", "ignore tables, must be database.table format, separated by comma")
 
-var startName = flag.String("bin_name", "", "start sync from binlog name")
-var startPos = flag.Uint("bin_pos", 0, "start sync from binlog position of")
+	startName = flag.String("bin_name", "", "start sync from binlog name")
+	startPos  = flag.Uint("bin_pos", 0, "start sync from binlog position of")
 
-var heartbeatPeriod = flag.Duration("heartbeat", 60*time.Second, "master heartbeat period")
-var readTimeout = flag.Duration("read_timeout", 90*time.Second, "connection read timeout")
+	gtid = flag.String("gtid", "", "start sync from GTID set, e.g. 'de278ad0-2106-11e4-9f8e-6edd0ca20947:1-2' (MySQL) or '0-1-1' (MariaDB)")
+
+	heartbeatPeriod = flag.Duration("heartbeat", 60*time.Second, "master heartbeat period")
+	readTimeout     = flag.Duration("read_timeout", 90*time.Second, "connection read timeout")
+)
 
 func main() {
 	flag.Parse()
 
+	err := mysql.ValidateFlavor(*flavor)
+	if err != nil {
+		fmt.Printf("Flavor error: %v\n", errors.ErrorStack(err))
+		os.Exit(1)
+	}
+
 	cfg := canal.NewDefaultConfig()
-	cfg.Addr = fmt.Sprintf("%s:%d", *host, *port)
+	cfg.Addr = net.JoinHostPort(*host, strconv.Itoa(*port))
 	cfg.User = *user
 	cfg.Password = *password
 	cfg.Flavor = *flavor
+	cfg.UseDecimal = true
 
 	cfg.ReadTimeout = *readTimeout
 	cfg.HeartbeatPeriod = *heartbeatPeriod
@@ -51,13 +65,13 @@ func main() {
 
 	c, err := canal.NewCanal(cfg)
 	if err != nil {
-		fmt.Printf("create canal err %v", err)
+		fmt.Printf("create canal err: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(*ignoreTables) == 0 {
-		subs := strings.Split(*ignoreTables, ",")
-		for _, sub := range subs {
+	if len(*ignoreTables) > 0 {
+		subs := strings.SplitSeq(*ignoreTables, ",")
+		for sub := range subs {
 			if seps := strings.Split(sub, "."); len(seps) == 2 {
 				c.AddDumpIgnoreTables(seps[0], seps[1])
 			}
@@ -74,22 +88,35 @@ func main() {
 
 	c.SetEventHandler(&handler{})
 
-	startPos := mysql.Position{
-		Name: *startName,
-		Pos:  uint32(*startPos),
+	// Parse GTID in main goroutine so invalid GTID causes immediate exit.
+	var gset mysql.GTIDSet
+	if len(*gtid) > 0 {
+		var err error
+		gset, err = mysql.ParseGTIDSet(*flavor, *gtid)
+		if err != nil {
+			fmt.Printf("parse GTID set err: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	go func() {
-		err = c.RunFrom(startPos)
+		var err error
+		if gset != nil {
+			err = c.StartFromGTID(gset)
+		} else {
+			from := mysql.Position{
+				Name: *startName,
+				Pos:  uint32(*startPos),
+			}
+			err = c.RunFrom(from)
+		}
 		if err != nil {
-			fmt.Printf("start canal err %v", err)
+			fmt.Printf("start canal err: %v\n", err)
 		}
 	}()
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc,
-		os.Kill,
-		os.Interrupt,
 		syscall.SIGHUP,
 		syscall.SIGINT,
 		syscall.SIGTERM,

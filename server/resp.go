@@ -1,46 +1,52 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 
-	. "github.com/siddontang/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 )
 
-func (c *Conn) writeOK(r *Result) error {
+func (c *Conn) writeOK(r *mysql.Result) error {
 	if r == nil {
-		r = &Result{}
+		r = mysql.NewResultReserveResultset(0)
 	}
 
 	r.Status |= c.status
 
 	data := make([]byte, 4, 32)
 
-	data = append(data, OK_HEADER)
+	data = append(data, mysql.OK_HEADER)
 
-	data = append(data, PutLengthEncodedInt(r.AffectedRows)...)
-	data = append(data, PutLengthEncodedInt(r.InsertId)...)
+	data = append(data, mysql.PutLengthEncodedInt(r.AffectedRows)...)
+	data = append(data, mysql.PutLengthEncodedInt(r.InsertId)...)
 
-	if c.capability&CLIENT_PROTOCOL_41 > 0 {
+	if c.capability&mysql.CLIENT_PROTOCOL_41 > 0 {
 		data = append(data, byte(r.Status), byte(r.Status>>8))
-		data = append(data, 0, 0)
+		data = append(data, byte(r.Warnings), byte(r.Warnings>>8))
+	}
+
+	if c.capability&mysql.CLIENT_SESSION_TRACK > 0 {
+		data = mysql.AppendOKSessionTrackSuffix(data, r)
 	}
 
 	return c.WritePacket(data)
 }
 
 func (c *Conn) writeError(e error) error {
-	var m *MyError
-	var ok bool
-	if m, ok = e.(*MyError); !ok {
-		m = NewError(ER_UNKNOWN_ERROR, e.Error())
+	var m *mysql.MyError
+	if !errors.As(e, &m) {
+		m = mysql.NewError(mysql.ER_UNKNOWN_ERROR, e.Error())
 	}
 
 	data := make([]byte, 4, 16+len(m.Message))
 
-	data = append(data, ERR_HEADER)
+	data = append(data, mysql.ERR_HEADER)
 	data = append(data, byte(m.Code), byte(m.Code>>8))
 
-	if c.capability&CLIENT_PROTOCOL_41 > 0 {
+	if c.capability&mysql.CLIENT_PROTOCOL_41 > 0 {
 		data = append(data, '#')
 		data = append(data, m.State...)
 	}
@@ -53,17 +59,104 @@ func (c *Conn) writeError(e error) error {
 func (c *Conn) writeEOF() error {
 	data := make([]byte, 4, 9)
 
-	data = append(data, EOF_HEADER)
-	if c.capability&CLIENT_PROTOCOL_41 > 0 {
-		data = append(data, 0, 0)
+	data = append(data, mysql.EOF_HEADER)
+	if c.capability&mysql.CLIENT_PROTOCOL_41 > 0 {
+		data = append(data, byte(c.warnings), byte(c.warnings>>8))
 		data = append(data, byte(c.status), byte(c.status>>8))
 	}
 
 	return c.WritePacket(data)
 }
 
-func (c *Conn) writeResultset(r *Resultset) error {
-	columnLen := PutLengthEncodedInt(uint64(len(r.Fields)))
+// writeEOFOrOK terminates a packet sequence: a classic EOF packet, or an
+// EOF-headered (0xFE) OK packet when CLIENT_DEPRECATE_EOF is negotiated, as
+// MySQL 5.7.5+ sends. No session-state suffix: the packet must stay under the
+// 9-byte threshold clients use to recognize EOF packets.
+func (c *Conn) writeEOFOrOK() error {
+	if !c.deprecateEOF() {
+		return c.writeEOF()
+	}
+
+	data := make([]byte, 4, 16)
+
+	data = append(data, mysql.EOF_HEADER)
+	data = append(data, mysql.PutLengthEncodedInt(0)...) // affected rows
+	data = append(data, mysql.PutLengthEncodedInt(0)...) // last insert id
+	data = append(data, byte(c.status), byte(c.status>>8))
+	data = append(data, byte(c.warnings), byte(c.warnings>>8))
+
+	return c.WritePacket(data)
+}
+
+// see: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_auth_switch_request.html
+func (c *Conn) writeAuthSwitchRequest(newAuthPluginName string) error {
+	c.authPluginName = newAuthPluginName
+	data := make([]byte, 4)
+	data = append(data, mysql.EOF_HEADER)
+	data = append(data, []byte(newAuthPluginName)...)
+	data = append(data, 0x00)
+	// new auth data
+	c.salt = mysql.RandomBuf(20)
+	data = append(data, c.salt...)
+	// the online doc states it's a string.EOF, however, the actual MySQL server add a \NUL to the end, without it, the
+	// official MySQL client will fail.
+	data = append(data, 0x00)
+	return c.WritePacket(data)
+}
+
+// see: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_auth_switch_response.html
+func (c *Conn) readAuthSwitchRequestResponse() ([]byte, error) {
+	data, err := c.ReadPacket()
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 1 && data[0] == 0x00 {
+		// \NUL
+		return make([]byte, 0), nil
+	}
+	return data, nil
+}
+
+func (c *Conn) writeAuthMoreDataPubkey() error {
+	if len(c.serverConf.rsaPublicKeyBytes) == 0 {
+		return errors.New("RSA key not configured; non-TLS connections are not supported for this authentication method")
+	}
+	data := make([]byte, 4)
+	data = append(data, mysql.MORE_DATE_HEADER)
+	data = append(data, c.serverConf.rsaPublicKeyBytes...)
+	return c.WritePacket(data)
+}
+
+func (c *Conn) writeAuthMoreDataFullAuth() error {
+	data := make([]byte, 4)
+	data = append(data, mysql.MORE_DATE_HEADER)
+	data = append(data, mysql.CACHE_SHA2_FULL_AUTH)
+	return c.WritePacket(data)
+}
+
+func (c *Conn) writeAuthMoreDataFastAuth() error {
+	data := make([]byte, 4)
+	data = append(data, mysql.MORE_DATE_HEADER)
+	data = append(data, mysql.CACHE_SHA2_FAST_AUTH)
+	return c.WritePacket(data)
+}
+
+func (c *Conn) writeResultset(r *mysql.Resultset) error {
+	// for a streaming resultset, that handled rowdata separately in a callback
+	// of type SelectPerRowCallback, we can suffice by ending the stream with
+	// an EOF
+	// when streaming multiple queries, no EOF has to be sent, all results should've
+	// been taken care of already in the user-defined callback
+	if r.StreamingDone {
+		switch r.Streaming {
+		case mysql.StreamingMultiple:
+			return nil
+		case mysql.StreamingSelect:
+			return c.writeEOFOrOK()
+		}
+	}
+
+	columnLen := mysql.PutLengthEncodedInt(uint64(len(r.Fields)))
 
 	data := make([]byte, 4, 1024)
 
@@ -72,16 +165,21 @@ func (c *Conn) writeResultset(r *Resultset) error {
 		return err
 	}
 
-	for _, v := range r.Fields {
-		data = data[0:4]
-		data = append(data, v.Dump()...)
-		if err := c.WritePacket(data); err != nil {
+	if err := c.writeFieldList(r.Fields, data); err != nil {
+		return err
+	}
+
+	// no separator between column definitions and rows under CLIENT_DEPRECATE_EOF
+	if !c.deprecateEOF() {
+		if err := c.writeEOF(); err != nil {
 			return err
 		}
 	}
 
-	if err := c.writeEOF(); err != nil {
-		return err
+	// streaming select resultsets handle rowdata in a separate callback of type
+	// SelectPerRowCallback so we're done here
+	if r.Streaming == mysql.StreamingSelect {
+		return nil
 	}
 
 	for _, v := range r.RowDatas {
@@ -92,15 +190,132 @@ func (c *Conn) writeResultset(r *Resultset) error {
 		}
 	}
 
-	if err := c.writeEOF(); err != nil {
+	if err := c.writeEOFOrOK(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (c *Conn) writeFieldList(fs []*Field) error {
+func (c *Conn) writeStreamResultset(sr *mysql.StreamResult) error {
+	// Ensure the stream is closed when we're done, whether successful or not.
+	// This prevents producer goroutines from blocking indefinitely if an error
+	// occurs during row processing.
+	defer sr.Close()
+
+	columnLen := mysql.PutLengthEncodedInt(uint64(len(sr.Fields)))
 	data := make([]byte, 4, 1024)
+	data = append(data, columnLen...)
+	if err := c.WritePacket(data); err != nil {
+		return err
+	}
+
+	if err := c.writeFieldList(sr.Fields, data); err != nil {
+		return err
+	}
+
+	// no separator between column definitions and rows under CLIENT_DEPRECATE_EOF
+	if !c.deprecateEOF() {
+		if err := c.writeEOF(); err != nil {
+			return err
+		}
+	}
+
+	if sr.Binary {
+		return c.writeStreamBinaryRows(sr)
+	}
+	return c.writeStreamTextRows(sr)
+}
+
+// writeStreamTextRows writes rows using text protocol.
+func (c *Conn) writeStreamTextRows(sr *mysql.StreamResult) error {
+	data := make([]byte, 4, 1024)
+	for row := range sr.RowsChan() {
+		data = data[0:4]
+		for _, v := range row {
+			if v == nil {
+				data = append(data, 0xfb) // NULL
+			} else {
+				tv, err := mysql.FormatTextValue(v)
+				if err != nil {
+					return err
+				}
+				data = append(data, mysql.PutLengthEncodedString(tv)...)
+			}
+		}
+		if err := c.WritePacket(data); err != nil {
+			return err
+		}
+		// Deliver each streamed row immediately; RowsChan may block indefinitely.
+		if err := c.Flush(); err != nil {
+			return err
+		}
+	}
+
+	if err := sr.Err(); err != nil {
+		return c.writeError(err)
+	}
+
+	return c.writeEOFOrOK()
+}
+
+// writeStreamBinaryRows writes rows using binary protocol.
+func (c *Conn) writeStreamBinaryRows(sr *mysql.StreamResult) error {
+	data := make([]byte, 4, 1024)
+	columnCount := len(sr.Fields)
+	bitmapLen := (columnCount + 7 + 2) >> 3
+	// Reused across rows; data's append copies the bytes before each
+	// iteration mutates them.
+	nullBitmap := make([]byte, bitmapLen)
+
+	for row := range sr.RowsChan() {
+		data = data[0:4]
+		clear(nullBitmap)
+
+		// Binary row header: 0x00
+		data = append(data, 0x00)
+		// Placeholder for null bitmap
+		data = append(data, nullBitmap...)
+
+		for j, v := range row {
+			b, err := mysql.EncodeBinaryFieldValue(sr.Fields[j], v)
+			if err != nil {
+				return err
+			}
+			if b == nil {
+				// Encoder signaled NULL. Bit position is (column index + 2)
+				// per the binary protocol.
+				nullBitmap[(j+2)/8] |= 1 << (uint(j+2) % 8)
+				continue
+			}
+			data = append(data, b...)
+		}
+
+		// Copy null bitmap to the correct position
+		copy(data[5:], nullBitmap)
+
+		if err := c.WritePacket(data); err != nil {
+			return err
+		}
+		// Deliver each streamed row immediately; RowsChan may block indefinitely.
+		if err := c.Flush(); err != nil {
+			return err
+		}
+	}
+
+	if err := sr.Err(); err != nil {
+		return c.writeError(err)
+	}
+
+	return c.writeEOFOrOK()
+}
+
+// writeFieldList writes one packet per column definition and no terminator;
+// the caller appends an EOF packet, an EOF-headered OK, or nothing.
+func (c *Conn) writeFieldList(fs []*mysql.Field, data []byte) error {
+	if data == nil {
+		data = make([]byte, 4, 1024)
+	}
 
 	for _, v := range fs {
 		data = data[0:4]
@@ -110,32 +325,126 @@ func (c *Conn) writeFieldList(fs []*Field) error {
 		}
 	}
 
-	if err := c.writeEOF(); err != nil {
-		return err
-	}
 	return nil
 }
 
-type noResponse struct{}
+func (c *Conn) writeFieldValues(fv []mysql.FieldValue) error {
+	data := make([]byte, 4, 1024)
+	for _, v := range fv {
+		if v.Value() == nil {
+			// NULL value is encoded as 0xfb here
+			data = append(data, []byte{0xfb}...)
+		} else {
+			tv, err := mysql.FormatTextValue(v.Value())
+			if err != nil {
+				return err
+			}
+			data = append(data, mysql.PutLengthEncodedString(tv)...)
+		}
+	}
 
-func (c *Conn) writeValue(value interface{}) error {
+	return c.WritePacket(data)
+}
+
+// see: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_replication.html
+func (c *Conn) writeBinlogEvents(s *replication.BinlogStreamer) error {
+	for {
+		ev, err := s.GetEvent(context.Background())
+		if err != nil {
+			return err
+		}
+		data := make([]byte, 4, 4+len(ev.RawData))
+		data = append(data, mysql.OK_HEADER)
+
+		data = append(data, ev.RawData...)
+		if err := c.WritePacket(data); err != nil {
+			return err
+		}
+		// Deliver each event immediately (heartbeat/semi-sync timing); GetEvent
+		// may block indefinitely.
+		if err := c.Flush(); err != nil {
+			return err
+		}
+	}
+}
+
+// writeCursorResultset writes the COM_STMT_EXECUTE response of a cursor: the
+// column definitions and their terminator, which carries
+// SERVER_STATUS_CURSOR_EXISTS. No rows are sent here, COM_STMT_FETCH sends them.
+func (c *Conn) writeCursorResultset(r *mysql.Resultset) error {
+	data := make([]byte, 4, 1024)
+	data = append(data, mysql.PutLengthEncodedInt(uint64(len(r.Fields)))...)
+	if err := c.WritePacket(data); err != nil {
+		return err
+	}
+
+	if err := c.writeFieldList(r.Fields, data); err != nil {
+		return err
+	}
+
+	// Under CLIENT_DEPRECATE_EOF this OK packet is the only terminator the
+	// client gets; without it, the client reads the status from the EOF.
+	return c.writeEOFOrOK()
+}
+
+// writeCursorRows writes a COM_STMT_FETCH response: a batch of already encoded
+// binary rows followed by an EOF carrying the cursor status flags.
+func (c *Conn) writeCursorRows(rows []mysql.RowData) error {
+	data := make([]byte, 4, 1024)
+	for _, v := range rows {
+		data = data[0:4]
+		data = append(data, v...)
+		if err := c.WritePacket(data); err != nil {
+			return err
+		}
+	}
+
+	return c.writeEOFOrOK()
+}
+
+type (
+	noResponse  struct{}
+	eofResponse struct{}
+
+	// cursorResult is the response to a COM_STMT_EXECUTE that opened a cursor.
+	cursorResult struct{ rs *mysql.Resultset }
+	// cursorRows is the response to a COM_STMT_FETCH: one batch of rows.
+	cursorRows []mysql.RowData
+)
+
+func (c *Conn) WriteValue(value any) error {
 	switch v := value.(type) {
 	case noResponse:
 		return nil
+	case eofResponse:
+		return c.writeEOFOrOK()
 	case error:
 		return c.writeError(v)
 	case nil:
 		return c.writeOK(nil)
-	case *Result:
-		if v != nil && v.Resultset != nil {
+	case *mysql.Result:
+		if v != nil && v.IsStreaming() {
+			return c.writeStreamResultset(v.StreamResult)
+		} else if v != nil && v.HasResultset() {
 			return c.writeResultset(v.Resultset)
-		} else {
-			return c.writeOK(v)
 		}
-	case []*Field:
-		return c.writeFieldList(v)
+		return c.writeOK(v)
+	case []*mysql.Field:
+		// COM_FIELD_LIST response: column definitions, then a terminator.
+		if err := c.writeFieldList(v, nil); err != nil {
+			return err
+		}
+		return c.writeEOFOrOK()
+	case []mysql.FieldValue:
+		return c.writeFieldValues(v)
+	case *replication.BinlogStreamer:
+		return c.writeBinlogEvents(v)
 	case *Stmt:
 		return c.writePrepare(v)
+	case cursorResult:
+		return c.writeCursorResultset(v.rs)
+	case cursorRows:
+		return c.writeCursorRows(v)
 	default:
 		return fmt.Errorf("invalid response type %T", value)
 	}
